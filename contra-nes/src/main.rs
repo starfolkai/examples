@@ -162,7 +162,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     let mut rom_path = String::from("contra.nes");
-    let mut mode = "benchmark"; // benchmark, headless, terminal, export
+    let mut mode = "window"; // window, benchmark, headless, terminal, export
     let mut max_frames = 6000u32;
     let mut scale = 4usize;
     let mut export_dir = String::from(".");
@@ -172,6 +172,7 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "--rom" => { i += 1; rom_path = args[i].clone(); }
+            "--window" | "-w" => { mode = "window"; }
             "--benchmark" | "-b" => { mode = "benchmark"; }
             "--headless" => { mode = "headless"; }
             "--terminal" | "-t" => { mode = "terminal"; }
@@ -209,6 +210,65 @@ fn main() {
     let mut frame_num = 0u32;
 
     match mode {
+        "window" => {
+            use minifb::{Key, Window, WindowOptions};
+
+            let win_w = SCREEN_W * scale;
+            let win_h = SCREEN_H * scale;
+            let mut window = Window::new(
+                "Contra NES",
+                win_w, win_h,
+                WindowOptions {
+                    resize: false,
+                    scale_mode: minifb::ScaleMode::AspectRatioStretch,
+                    ..WindowOptions::default()
+                },
+            ).expect("Failed to create window");
+
+            window.set_target_fps(60);
+
+            let mut fb32 = vec![0u32; SCREEN_W * SCREEN_H];
+            let mut autoplay_done = false;
+
+            while window.is_open() && !window.is_key_down(Key::Escape) && frame_num < max_frames {
+                // Autoplay Konami code + start
+                if !autoplay_done {
+                    while seq_idx < seq.len() && seq[seq_idx].frame <= frame_num {
+                        nes.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
+                        seq_idx += 1;
+                    }
+                    if frame_num > 900 {
+                        autoplay_done = true;
+                        for b in 0..8 { nes.set_button(0, b, false); }
+                    }
+                }
+
+                if autoplay_done {
+                    // Keyboard → NES buttons
+                    nes.set_button(0, BTN_RIGHT, window.is_key_down(Key::Right) || window.is_key_down(Key::D));
+                    nes.set_button(0, BTN_LEFT, window.is_key_down(Key::Left) || window.is_key_down(Key::A));
+                    nes.set_button(0, BTN_UP, window.is_key_down(Key::Up) || window.is_key_down(Key::W));
+                    nes.set_button(0, BTN_DOWN, window.is_key_down(Key::Down) || window.is_key_down(Key::S));
+                    nes.set_button(0, BTN_A, window.is_key_down(Key::Z) || window.is_key_down(Key::J));
+                    nes.set_button(0, BTN_B, window.is_key_down(Key::X) || window.is_key_down(Key::K));
+                    nes.set_button(0, BTN_START, window.is_key_down(Key::Enter));
+                    nes.set_button(0, BTN_SELECT, window.is_key_down(Key::Space));
+                }
+
+                nes.run_frame();
+                frame_num += 1;
+
+                // Convert RGB24 framebuffer → ARGB32 for minifb
+                let fb = nes.framebuffer();
+                for i in 0..SCREEN_W * SCREEN_H {
+                    let o = i * 3;
+                    fb32[i] = (fb[o] as u32) << 16 | (fb[o + 1] as u32) << 8 | fb[o + 2] as u32;
+                }
+                window.update_with_buffer(&fb32, SCREEN_W, SCREEN_H).unwrap();
+            }
+            eprintln!("  Played {} frames", frame_num);
+        }
+
         "benchmark" => {
             eprintln!("  Running {} frames...", max_frames);
             let t0 = Instant::now();

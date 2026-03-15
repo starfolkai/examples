@@ -1,8 +1,6 @@
 # contra-nes
 
-Native NES emulator in Rust. Plays Contra. Zero external dependencies in the hot path.
-
-Built for speed: **500+ fps** (8x NES realtime) with full CPU + PPU emulation.
+Native NES emulator in Rust. Plays Contra in a window. 500+ fps.
 
 ## Build
 
@@ -10,31 +8,39 @@ Built for speed: **500+ fps** (8x NES realtime) with full CPU + PPU emulation.
 cargo build --release
 ```
 
+On Linux you need X11 dev headers: `sudo apt install libx11-dev libxkbcommon-dev`
+
 ## Play
 
 ```bash
-# Interactive mode — plays in your terminal
-./target/release/contra-nes --rom contra.nes --play --scale 4
+# Opens a window — this is the default mode
+./target/release/contra-nes --rom contra.nes
 
-# Controls:
-#   WASD  = D-pad (move/aim)
-#   J     = A button (jump)
-#   K     = B button (shoot)
-#   Enter = Start
-#   Space = Select
-#   Q     = Quit
+# Scale up (default 4x)
+./target/release/contra-nes --rom contra.nes --scale 3
 ```
 
-The game auto-enters the Konami code (30 lives) and starts for you. After the intro, keyboard control hands off to you.
+The game auto-enters the Konami code (30 lives) and starts. After the intro, you have full control.
+
+### Controls
+
+| Key | NES Button |
+|-----|------------|
+| Arrow keys or WASD | D-pad |
+| Z or J | A (jump) |
+| X or K | B (shoot) |
+| Enter | Start |
+| Space | Select |
+| Escape | Quit |
 
 ## Other modes
 
 ```bash
-# Watch the AI autoplay in terminal
-./target/release/contra-nes --rom contra.nes --terminal --scale 4
-
-# Benchmark
+# Benchmark (headless, max speed)
 ./target/release/contra-nes --rom contra.nes --benchmark --frames 5000
+
+# Terminal rendering (ANSI truecolor, no window needed)
+./target/release/contra-nes --rom contra.nes --terminal --scale 4
 
 # Export frames as BMP/PPM
 ./target/release/contra-nes --rom contra.nes --export --interval 100
@@ -47,7 +53,7 @@ The game auto-enters the Konami code (30 lives) and starts for you. After the in
 
 ## Architecture
 
-~1400 lines of Rust across 6 modules:
+~1500 lines of Rust across 6 modules:
 
 | Module | What |
 |--------|------|
@@ -56,9 +62,7 @@ The game auto-enters the Konami code (30 lives) and starts for you. After the in
 | `cartridge.rs` | iNES loader + Mapper 2 (UxROM) bank switching |
 | `bus.rs` | Memory map, OAM DMA, controller I/O |
 | `nes.rs` | System clock: 3 PPU ticks per CPU cycle |
-| `main.rs` | CLI, terminal renderer (truecolor ANSI half-blocks), input handling |
-
-Only dependency is `libc` for raw terminal mode. The emulation core is zero-dependency.
+| `main.rs` | CLI, windowed display (minifb), terminal renderer, input handling |
 
 ## ROM
 
