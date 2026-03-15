@@ -1,0 +1,6 @@
+/target
+*.nes
+*.bmp
+*.ppm
+*.bin
+*.png
