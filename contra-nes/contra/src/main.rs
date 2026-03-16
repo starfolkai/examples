@@ -11,6 +11,9 @@ mod cpu_state;
 mod interpreter;
 mod nes;
 mod ppu;
+mod renderer;
+mod sprite;
+mod tile_map;
 
 use std::env;
 use std::io::Write;
