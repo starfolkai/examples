@@ -31,7 +31,7 @@ impl Nes {
         self.bus.ppu.frame_count
     }
 
-    /// Single CPU step + PPU ticks
+    /// Single CPU step + PPU ticks + APU clock
     #[inline(always)]
     fn step(&mut self) {
         // Handle DMA
@@ -49,6 +49,22 @@ impl Nes {
             if nmi {
                 self.cpu.nmi_pending = true;
             }
+        }
+
+        // Clock APU once per CPU cycle
+        for _ in 0..cpu_cycles {
+            self.bus.apu.clock();
+
+            // Handle DMC memory reads
+            if let Some(addr) = self.bus.apu.dmc_read_pending.take() {
+                let byte = self.bus.read(addr);
+                self.bus.apu.dmc_fill_buffer(byte);
+            }
+        }
+
+        // APU frame IRQ
+        if self.bus.apu.frame_irq {
+            self.cpu.irq_pending = true;
         }
     }
 

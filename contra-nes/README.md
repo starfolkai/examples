@@ -8,7 +8,7 @@ Native NES emulator in Rust. Plays Contra in a window. 500+ fps.
 cargo build --release
 ```
 
-On Linux you need X11 dev headers: `sudo apt install libx11-dev libxkbcommon-dev`
+On Linux you need X11 and ALSA dev headers: `sudo apt install libx11-dev libxkbcommon-dev libasound2-dev`
 
 ## Play
 
@@ -53,16 +53,17 @@ The game auto-enters the Konami code (30 lives) and starts. After the intro, you
 
 ## Architecture
 
-~1500 lines of Rust across 6 modules:
+~2000 lines of Rust across 7 modules:
 
 | Module | What |
 |--------|------|
 | `cpu.rs` | MOS 6502 — all legal opcodes + common illegals (LAX, SAX, DCP, ISB, SLO, RLA, SRE, RRA) |
 | `ppu.rs` | 2C02 PPU — scanline-accurate BG + sprites, attribute tables, scroll, sprite 0 hit, NMI |
+| `apu.rs` | 2A03 APU — pulse 1 & 2, triangle, noise, DMC, frame counter, nonlinear mixer |
 | `cartridge.rs` | iNES loader + Mapper 2 (UxROM) bank switching |
-| `bus.rs` | Memory map, OAM DMA, controller I/O |
-| `nes.rs` | System clock: 3 PPU ticks per CPU cycle |
-| `main.rs` | CLI, windowed display (minifb), terminal renderer, input handling |
+| `bus.rs` | Memory map, OAM DMA, APU registers, controller I/O |
+| `nes.rs` | System clock: 3 PPU ticks per CPU cycle, APU clocking |
+| `main.rs` | CLI, windowed display (minifb), audio output (cpal), input handling |
 
 ## ROM
 

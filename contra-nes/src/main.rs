@@ -4,6 +4,7 @@
 // Terminal renderer with truecolor ANSI. Headless benchmark mode.
 // Autoplay with Konami code for 30 lives.
 
+mod apu;
 mod bus;
 mod cartridge;
 mod cpu;
@@ -227,6 +228,37 @@ fn main() {
 
             // Don't use minifb's fps limiter — we do our own timing
             window.set_target_fps(0);
+
+            // Start audio output stream
+            let audio_buf = nes.bus.apu.audio_buffer();
+            let _audio_stream = {
+                use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+                let host = cpal::default_host();
+                let device = host.default_output_device();
+                device.and_then(|dev| {
+                    let config = cpal::StreamConfig {
+                        channels: 1,
+                        sample_rate: cpal::SampleRate(apu::SAMPLE_RATE),
+                        buffer_size: cpal::BufferSize::Default,
+                    };
+                    let buf = audio_buf.clone();
+                    let stream = dev.build_output_stream(
+                        &config,
+                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                            if let Ok(mut ab) = buf.lock() {
+                                for sample in data.iter_mut() {
+                                    *sample = ab.read();
+                                }
+                            }
+                        },
+                        |err| eprintln!("Audio error: {}", err),
+                        None,
+                    ).ok()?;
+                    stream.play().ok()?;
+                    eprintln!("  Audio: enabled (44.1kHz mono)");
+                    Some(stream)
+                })
+            };
 
             let mut fb32 = vec![0u32; SCREEN_W * SCREEN_H];
             let mut autoplay_done = false;

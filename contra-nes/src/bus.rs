@@ -5,6 +5,7 @@
 // $4000-$4017: APU + I/O
 // $4018-$FFFF: Cartridge space (mapper handles banking)
 
+use crate::apu::Apu;
 use crate::cartridge::Cartridge;
 use crate::ppu::Ppu;
 
@@ -12,6 +13,7 @@ pub struct Bus {
     pub ram: [u8; 2048],
     pub cart: Cartridge,
     pub ppu: Ppu,
+    pub apu: Apu,
     pub controller: [u8; 2],     // current button state
     pub controller_shift: [u8; 2], // shift register for reads
     pub controller_strobe: bool,
@@ -24,6 +26,7 @@ impl Bus {
         Bus {
             ram: [0; 2048],
             ppu: Ppu::new(),
+            apu: Apu::new(),
             cart,
             controller: [0; 2],
             controller_shift: [0; 2],
@@ -52,7 +55,8 @@ impl Bus {
                 self.controller_shift[1] |= 0x80;
                 val
             }
-            0x4000..=0x4015 => 0, // APU (stub)
+            0x4015 => self.apu.read_status(),
+            0x4000..=0x4014 => 0, // APU write-only registers
             0x4018..=0x5FFF => 0, // expansion (unused by Contra)
             0x6000..=0x7FFF => 0, // PRG RAM (Contra doesn't use it)
             0x8000..=0xFFFF => self.cart.read_prg(addr),
@@ -78,7 +82,9 @@ impl Bus {
                     self.controller_shift[1] = self.controller[1];
                 }
             }
-            0x4000..=0x4017 => {} // APU (stub)
+            0x4000..=0x4013 | 0x4015 | 0x4017 => {
+                self.apu.write_register(addr, val);
+            }
             0x8000..=0xFFFF => self.cart.write_prg(addr, val),
             _ => {}
         }
