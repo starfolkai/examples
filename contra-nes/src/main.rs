@@ -17,6 +17,78 @@ use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 use std::time::Instant;
 
+/// Request realtime thread priority to minimize OS scheduling jitter.
+/// On macOS: uses Mach thread_policy_set with THREAD_TIME_CONSTRAINT_POLICY.
+/// On Linux: uses sched_setscheduler with SCHED_RR (requires root or CAP_SYS_NICE).
+/// Fails silently — realtime priority is a nice-to-have, not required.
+fn request_realtime_priority() {
+    #[cfg(target_os = "macos")]
+    {
+        // Mach realtime thread scheduling
+        #[repr(C)]
+        struct ThreadTimeConstraintPolicy {
+            period: u32,
+            computation: u32,
+            constraint: u32,
+            preemptible: i32,
+        }
+
+        const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
+
+        extern "C" {
+            fn mach_thread_self() -> u32;
+            fn thread_policy_set(
+                thread: u32,
+                flavor: u32,
+                policy_info: *const ThreadTimeConstraintPolicy,
+                count: u32,
+            ) -> i32;
+        }
+
+        // Target: 60fps = 16.67ms period
+        // On Apple Silicon ~24MHz timebase; on Intel varies (use ~1GHz approximation)
+        // mach_absolute_time uses a timebase that differs per CPU, but for scheduling
+        // hints the kernel normalizes — use nanosecond-scale values
+        let policy = ThreadTimeConstraintPolicy {
+            period: 16_666_667,       // 16.67ms in ns (one frame at 60fps)
+            computation: 2_000_000,   // 2ms computation budget per frame
+            constraint: 4_000_000,    // 4ms hard deadline
+            preemptible: 1,           // allow preemption within constraint
+        };
+
+        let ret = unsafe {
+            thread_policy_set(
+                mach_thread_self(),
+                THREAD_TIME_CONSTRAINT_POLICY,
+                &policy as *const ThreadTimeConstraintPolicy,
+                4, // count = number of u32 fields
+            )
+        };
+
+        if ret == 0 {
+            eprintln!("  Thread: realtime priority (macOS THREAD_TIME_CONSTRAINT_POLICY)");
+        } else {
+            eprintln!("  Thread: realtime priority failed (ret={}), using default", ret);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let param = libc::sched_param { sched_priority: 10 };
+        let ret = unsafe { libc::sched_setscheduler(0, libc::SCHED_RR, &param) };
+        if ret == 0 {
+            eprintln!("  Thread: realtime priority (Linux SCHED_RR, priority=10)");
+        } else {
+            eprintln!("  Thread: realtime priority unavailable (need root/CAP_SYS_NICE), using default");
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        eprintln!("  Thread: realtime priority not supported on this platform");
+    }
+}
+
 use crate::nes::Nes;
 
 const SCREEN_W: usize = 256;
@@ -213,6 +285,8 @@ fn main() {
     match mode {
         "window" => {
             use minifb::{Key, Window, WindowOptions};
+
+            request_realtime_priority();
 
             let win_w = SCREEN_W * scale;
             let win_h = SCREEN_H * scale;
