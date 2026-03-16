@@ -1,15 +1,18 @@
-// contra-nes: Native Rust NES emulator
+// contra-nes: Native Rust Contra
 //
-// Full 6502 CPU + PPU. Zero external dependencies.
+// Game logic runs through a native Rust Game module.
+// ROM data is compiled into the binary — no external .nes file needed.
 // Terminal renderer with truecolor ANSI. Headless benchmark mode.
 // Autoplay with Konami code for 30 lives.
 
 mod apu;
-mod bus;
 mod cartridge;
-mod cpu;
-mod nes;
-mod ppu;
+mod data;
+mod enemies;
+mod game;
+mod level;
+mod player;
+mod renderer;
 
 use std::env;
 use std::fs;
@@ -45,15 +48,11 @@ fn request_realtime_priority() {
             ) -> i32;
         }
 
-        // Target: 60fps = 16.67ms period
-        // On Apple Silicon ~24MHz timebase; on Intel varies (use ~1GHz approximation)
-        // mach_absolute_time uses a timebase that differs per CPU, but for scheduling
-        // hints the kernel normalizes — use nanosecond-scale values
         let policy = ThreadTimeConstraintPolicy {
-            period: 16_666_667,       // 16.67ms in ns (one frame at 60fps)
-            computation: 2_000_000,   // 2ms computation budget per frame
-            constraint: 4_000_000,    // 4ms hard deadline
-            preemptible: 1,           // allow preemption within constraint
+            period: 16_666_667,
+            computation: 2_000_000,
+            constraint: 4_000_000,
+            preemptible: 1,
         };
 
         let ret = unsafe {
@@ -61,7 +60,7 @@ fn request_realtime_priority() {
                 mach_thread_self(),
                 THREAD_TIME_CONSTRAINT_POLICY,
                 &policy as *const ThreadTimeConstraintPolicy,
-                4, // count = number of u32 fields
+                4,
             )
         };
 
@@ -89,7 +88,7 @@ fn request_realtime_priority() {
     }
 }
 
-use crate::nes::Nes;
+use crate::game::Game;
 
 const SCREEN_W: usize = 256;
 const SCREEN_H: usize = 240;
@@ -180,9 +179,9 @@ fn render_to_terminal(fb: &[u8], scale: usize) {
                 (0, 0, 0)
             };
 
-            // ▀ = upper half block: fg = top pixel, bg = bottom pixel
+            // upper half block: fg = top pixel, bg = bottom pixel
             out.push_str(&format!(
-                "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▀",
+                "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m\u{2580}",
                 tr, tg, tb, br, bg_, bb
             ));
         }
@@ -234,7 +233,6 @@ fn write_ppm(path: &str, px: &[u8], w: u32, h: u32) {
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let mut rom_path = String::from("contra.nes");
     let mut mode = "window"; // window, benchmark, headless, terminal, export
     let mut max_frames = u32::MAX; // unlimited for window/play modes
     let mut scale = 4usize;
@@ -244,7 +242,6 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--rom" => { i += 1; rom_path = args[i].clone(); }
             "--window" | "-w" => { mode = "window"; }
             "--benchmark" | "-b" => { mode = "benchmark"; }
             "--headless" => { mode = "headless"; }
@@ -256,27 +253,18 @@ fn main() {
             "--scale" | "-s" => { i += 1; scale = args[i].parse().unwrap_or(4); }
             "--dir" | "-d" => { i += 1; export_dir = args[i].clone(); }
             "--interval" => { i += 1; export_interval = args[i].parse().unwrap_or(500); }
-            _ => {
-                if args[i].ends_with(".nes") { rom_path = args[i].clone(); }
-            }
+            _ => {}
         }
         i += 1;
     }
 
-    eprintln!("contra-nes: Rust NES emulator");
+    eprintln!("contra-nes: Native Rust Contra");
     eprintln!("  Mode: {}", mode);
 
-    // Load ROM
-    let rom_data = fs::read(&rom_path).unwrap_or_else(|e| {
-        eprintln!("Error loading ROM '{}': {}", rom_path, e);
-        std::process::exit(1);
-    });
+    // Game data is compiled into the binary
+    let mut game = Game::new(data::PRG_DATA, data::PRG_BANKS);
 
-    let cart = cartridge::Cartridge::from_ines(&rom_data);
-    let mut nes = Nes::new(cart);
-
-    eprintln!("  ROM: {} ({} bytes)", rom_path, rom_data.len());
-    eprintln!("  Reset vector: ${:04X}", nes.cpu.pc);
+    eprintln!("  PRG: {} banks x 16KB = {}KB (compiled in)", data::PRG_BANKS, data::PRG_BANKS * 16);
 
     let seq = build_autoplay_sequence();
     let mut seq_idx = 0;
@@ -300,11 +288,10 @@ fn main() {
                 },
             ).expect("Failed to create window");
 
-            // Let minifb handle frame pacing (uses platform-native vsync/timing)
             window.set_target_fps(60);
 
             // Start audio output stream
-            let audio_buf = nes.bus.apu.audio_buffer();
+            let audio_buf = game.audio_buffer();
             let _audio_stream = {
                 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
                 let host = cpal::default_host();
@@ -339,42 +326,38 @@ fn main() {
             window.update_with_buffer(&fb32, SCREEN_W, SCREEN_H).unwrap();
 
             while window.is_open() && !window.is_key_down(Key::Escape) && frame_num < max_frames {
-                // 1. Read input (key state was refreshed by update_with_buffer at end of prev iteration)
                 if !autoplay_done {
                     while seq_idx < seq.len() && seq[seq_idx].frame <= frame_num {
-                        nes.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
+                        game.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
                         seq_idx += 1;
                     }
                     if frame_num > 900 {
                         autoplay_done = true;
-                        for b in 0..8 { nes.set_button(0, b, false); }
+                        for b in 0..8 { game.set_button(0, b, false); }
                     }
                 }
 
                 if autoplay_done {
-                    nes.set_button(0, BTN_RIGHT, window.is_key_down(Key::Right) || window.is_key_down(Key::D));
-                    nes.set_button(0, BTN_LEFT, window.is_key_down(Key::Left) || window.is_key_down(Key::A));
-                    nes.set_button(0, BTN_UP, window.is_key_down(Key::Up) || window.is_key_down(Key::W));
-                    nes.set_button(0, BTN_DOWN, window.is_key_down(Key::Down) || window.is_key_down(Key::S));
-                    nes.set_button(0, BTN_A, window.is_key_down(Key::Z) || window.is_key_down(Key::J));
-                    nes.set_button(0, BTN_B, window.is_key_down(Key::X) || window.is_key_down(Key::K));
-                    nes.set_button(0, BTN_START, window.is_key_down(Key::Enter));
-                    nes.set_button(0, BTN_SELECT, window.is_key_down(Key::Space));
+                    game.set_button(0, BTN_RIGHT, window.is_key_down(Key::Right) || window.is_key_down(Key::D));
+                    game.set_button(0, BTN_LEFT, window.is_key_down(Key::Left) || window.is_key_down(Key::A));
+                    game.set_button(0, BTN_UP, window.is_key_down(Key::Up) || window.is_key_down(Key::W));
+                    game.set_button(0, BTN_DOWN, window.is_key_down(Key::Down) || window.is_key_down(Key::S));
+                    game.set_button(0, BTN_A, window.is_key_down(Key::Z) || window.is_key_down(Key::J));
+                    game.set_button(0, BTN_B, window.is_key_down(Key::X) || window.is_key_down(Key::K));
+                    game.set_button(0, BTN_START, window.is_key_down(Key::Enter));
+                    game.set_button(0, BTN_SELECT, window.is_key_down(Key::Space));
                 }
 
-                // 2. Run emulator frame
-                nes.run_frame();
+                game.update();
+                game.render();
                 frame_num += 1;
 
-                // 3. Convert RGB24 → ARGB32 for minifb
-                let fb = nes.framebuffer();
+                let fb = game.framebuffer();
                 for i in 0..SCREEN_W * SCREEN_H {
                     let o = i * 3;
                     fb32[i] = (fb[o] as u32) << 16 | (fb[o + 1] as u32) << 8 | fb[o + 2] as u32;
                 }
 
-                // 4. Present frame — minifb handles timing internally (set_target_fps(60))
-                //    This also refreshes key state for the next iteration
                 window.update_with_buffer(&fb32, SCREEN_W, SCREEN_H).unwrap();
             }
             eprintln!("  Played {} frames", frame_num);
@@ -385,12 +368,11 @@ fn main() {
             let t0 = Instant::now();
 
             for _ in 0..max_frames {
-                // Apply input
                 while seq_idx < seq.len() && seq[seq_idx].frame <= frame_num {
-                    nes.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
+                    game.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
                     seq_idx += 1;
                 }
-                nes.run_frame();
+                game.update();
                 frame_num += 1;
             }
 
@@ -401,31 +383,29 @@ fn main() {
             eprintln!("  Speed: {:.1}x NES real-time (vs 60fps)", fps / 60.0);
             eprintln!("  {:.0} ns/frame", dt.as_nanos() as f64 / max_frames as f64);
 
-            // Save final frame
             let out = format!("{}/emu-frame-final.bmp", export_dir);
-            write_bmp(&out, nes.framebuffer(), SCREEN_W as u32, SCREEN_H as u32);
+            write_bmp(&out, game.framebuffer(), SCREEN_W as u32, SCREEN_H as u32);
             eprintln!("  Saved {}", out);
         }
 
         "terminal" => {
-            // Clear screen
             print!("\x1b[2J\x1b[?25l");
             io::stdout().flush().unwrap();
 
-            let frame_time = std::time::Duration::from_micros(16667); // ~60fps
+            let frame_time = std::time::Duration::from_micros(16667);
 
             for _ in 0..max_frames {
                 let t0 = Instant::now();
 
                 while seq_idx < seq.len() && seq[seq_idx].frame <= frame_num {
-                    nes.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
+                    game.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
                     seq_idx += 1;
                 }
-                nes.run_frame();
+                game.update();
                 frame_num += 1;
 
-                if frame_num % 2 == 0 { // render every other frame for speed
-                    render_to_terminal(nes.framebuffer(), scale);
+                if frame_num % 2 == 0 {
+                    render_to_terminal(game.framebuffer(), scale);
                 }
 
                 let elapsed = t0.elapsed();
@@ -434,7 +414,6 @@ fn main() {
                 }
             }
 
-            // Show cursor
             print!("\x1b[?25h\x1b[0m");
             io::stdout().flush().unwrap();
         }
@@ -443,23 +422,20 @@ fn main() {
             eprintln!("  Running {} frames headless...", max_frames);
             for _ in 0..max_frames {
                 while seq_idx < seq.len() && seq[seq_idx].frame <= frame_num {
-                    nes.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
+                    game.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
                     seq_idx += 1;
                 }
-                nes.run_frame();
+                game.update();
                 frame_num += 1;
             }
             eprintln!("  Done. Frame count: {}", frame_num);
         }
 
         "play" => {
-            // Interactive play with raw terminal input
-            // WASD = directions, J = A (jump), K = B (shoot), Enter = Start, Space = Select
             eprintln!("  Controls: WASD=move, J=jump(A), K=shoot(B), Enter=Start, Q=quit");
             eprintln!("  Starting in 1s...");
             std::thread::sleep(std::time::Duration::from_secs(1));
 
-            // Set terminal to raw mode
             let stdin_fd = io::stdin().as_raw_fd();
             let orig_termios = unsafe {
                 let mut t = std::mem::zeroed::<libc::termios>();
@@ -478,29 +454,23 @@ fn main() {
             let frame_time = std::time::Duration::from_micros(16667);
             let mut running = true;
             let mut input_buf = [0u8; 32];
-
-            // Apply autoplay up to game start, then hand off to player
             let mut autoplay_done = false;
 
             while running && frame_num < max_frames {
                 let t0 = Instant::now();
 
-                // Autoplay Konami code + start
                 if !autoplay_done {
                     while seq_idx < seq.len() && seq[seq_idx].frame <= frame_num {
-                        nes.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
+                        game.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
                         seq_idx += 1;
                     }
                     if frame_num > 900 {
                         autoplay_done = true;
-                        // Clear all buttons
-                        for b in 0..8 { nes.set_button(0, b, false); }
-                        // Hold right by default for fun
-                        nes.set_button(0, BTN_RIGHT, true);
+                        for b in 0..8 { game.set_button(0, b, false); }
+                        game.set_button(0, BTN_RIGHT, true);
                     }
                 }
 
-                // Read keyboard (non-blocking)
                 if autoplay_done {
                     let n = unsafe {
                         libc::read(stdin_fd, input_buf.as_mut_ptr() as *mut libc::c_void, input_buf.len())
@@ -508,42 +478,40 @@ fn main() {
                     if n > 0 {
                         for &b in &input_buf[..n as usize] {
                             match b {
-                                b'q' | 3 => { running = false; } // q or Ctrl-C
-                                b'w' => { nes.set_button(0, BTN_UP, true); }
-                                b's' => { nes.set_button(0, BTN_DOWN, true); }
-                                b'a' => { nes.set_button(0, BTN_LEFT, true); nes.set_button(0, BTN_RIGHT, false); }
-                                b'd' => { nes.set_button(0, BTN_RIGHT, true); nes.set_button(0, BTN_LEFT, false); }
-                                b'j' => { nes.set_button(0, BTN_A, true); }
-                                b'k' => { nes.set_button(0, BTN_B, true); }
-                                b'\r' | b'\n' => { nes.set_button(0, BTN_START, true); }
-                                b' ' => { nes.set_button(0, BTN_SELECT, true); }
-                                // Release on uppercase or repeated
-                                b'W' => { nes.set_button(0, BTN_UP, false); }
-                                b'S' => { nes.set_button(0, BTN_DOWN, false); }
-                                b'A' => { nes.set_button(0, BTN_LEFT, false); }
-                                b'D' => { nes.set_button(0, BTN_RIGHT, false); }
-                                b'J' => { nes.set_button(0, BTN_A, false); }
-                                b'K' => { nes.set_button(0, BTN_B, false); }
+                                b'q' | 3 => { running = false; }
+                                b'w' => { game.set_button(0, BTN_UP, true); }
+                                b's' => { game.set_button(0, BTN_DOWN, true); }
+                                b'a' => { game.set_button(0, BTN_LEFT, true); game.set_button(0, BTN_RIGHT, false); }
+                                b'd' => { game.set_button(0, BTN_RIGHT, true); game.set_button(0, BTN_LEFT, false); }
+                                b'j' => { game.set_button(0, BTN_A, true); }
+                                b'k' => { game.set_button(0, BTN_B, true); }
+                                b'\r' | b'\n' => { game.set_button(0, BTN_START, true); }
+                                b' ' => { game.set_button(0, BTN_SELECT, true); }
+                                b'W' => { game.set_button(0, BTN_UP, false); }
+                                b'S' => { game.set_button(0, BTN_DOWN, false); }
+                                b'A' => { game.set_button(0, BTN_LEFT, false); }
+                                b'D' => { game.set_button(0, BTN_RIGHT, false); }
+                                b'J' => { game.set_button(0, BTN_A, false); }
+                                b'K' => { game.set_button(0, BTN_B, false); }
                                 _ => {}
                             }
                         }
                     }
-                    // Auto-release momentary buttons after a few frames
                     if frame_num % 8 == 0 {
-                        nes.set_button(0, BTN_A, false);
-                        nes.set_button(0, BTN_B, false);
-                        nes.set_button(0, BTN_START, false);
-                        nes.set_button(0, BTN_SELECT, false);
-                        nes.set_button(0, BTN_UP, false);
-                        nes.set_button(0, BTN_DOWN, false);
+                        game.set_button(0, BTN_A, false);
+                        game.set_button(0, BTN_B, false);
+                        game.set_button(0, BTN_START, false);
+                        game.set_button(0, BTN_SELECT, false);
+                        game.set_button(0, BTN_UP, false);
+                        game.set_button(0, BTN_DOWN, false);
                     }
                 }
 
-                nes.run_frame();
+                game.update();
                 frame_num += 1;
 
                 if frame_num % 2 == 0 {
-                    render_to_terminal(nes.framebuffer(), scale);
+                    render_to_terminal(game.framebuffer(), scale);
                 }
 
                 let elapsed = t0.elapsed();
@@ -552,7 +520,6 @@ fn main() {
                 }
             }
 
-            // Restore terminal
             unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig_termios); }
             print!("\x1b[?25h\x1b[0m\n");
             io::stdout().flush().unwrap();
@@ -563,16 +530,16 @@ fn main() {
             eprintln!("  Exporting frames every {} to {}/", export_interval, export_dir);
             for _ in 0..max_frames {
                 while seq_idx < seq.len() && seq[seq_idx].frame <= frame_num {
-                    nes.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
+                    game.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
                     seq_idx += 1;
                 }
-                nes.run_frame();
+                game.update();
 
                 if frame_num % export_interval == 0 {
                     let path = format!("{}/emu-frame-{:05}.bmp", export_dir, frame_num);
-                    write_bmp(&path, nes.framebuffer(), SCREEN_W as u32, SCREEN_H as u32);
+                    write_bmp(&path, game.framebuffer(), SCREEN_W as u32, SCREEN_H as u32);
                     let ppm_path = format!("{}/emu-frame-{:05}.ppm", export_dir, frame_num);
-                    write_ppm(&ppm_path, nes.framebuffer(), SCREEN_W as u32, SCREEN_H as u32);
+                    write_ppm(&ppm_path, game.framebuffer(), SCREEN_W as u32, SCREEN_H as u32);
                     eprintln!("  Frame {}: saved", frame_num);
                 }
                 frame_num += 1;
@@ -581,19 +548,17 @@ fn main() {
         }
 
         "pipe" => {
-            // Raw RGB pipe to stdout for ffmpeg:
-            // contra-nes --pipe --frames 3600 | ffmpeg -f rawvideo -pix_fmt rgb24 -s 256x240 -r 60 -i - -c:v libx264 -pix_fmt yuv420p contra.mp4
             eprintln!("  Piping {} frames as raw RGB24 to stdout...", max_frames);
             let stdout = io::stdout();
             let mut out = io::BufWriter::new(stdout.lock());
 
             for _ in 0..max_frames {
                 while seq_idx < seq.len() && seq[seq_idx].frame <= frame_num {
-                    nes.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
+                    game.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
                     seq_idx += 1;
                 }
-                nes.run_frame();
-                out.write_all(&nes.framebuffer()[..SCREEN_W * SCREEN_H * 3]).unwrap();
+                game.update();
+                out.write_all(&game.framebuffer()[..SCREEN_W * SCREEN_H * 3]).unwrap();
                 frame_num += 1;
             }
             out.flush().unwrap();

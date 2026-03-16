@@ -11,6 +11,7 @@
 // Initially these will FAIL. Migration is complete when they all pass.
 
 use std::path::Path;
+use std::fs;
 
 const SRC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
 
@@ -185,5 +186,112 @@ fn has_native_renderer() {
     assert!(
         contents.contains("fn render"),
         "renderer.rs must have a render function"
+    );
+}
+
+// ── Level 5: Fully native — no NES emulation anywhere ──
+
+/// Scan ALL source files for NES emulation patterns.
+/// Level 5 means zero NES hardware emulation in the entire codebase.
+#[test]
+fn level5_no_emulation_in_any_source_file() {
+    let src = Path::new(SRC_DIR);
+    let mut failures = Vec::new();
+
+    for entry in fs::read_dir(src).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().map_or(true, |e| e != "rs") { continue; }
+        let name = path.file_name().unwrap().to_str().unwrap().to_string();
+        let contents = fs::read_to_string(&path).unwrap();
+
+        // No 6502 opcode dispatch (match arms like `0xA9 =>`)
+        if contents.contains("0xA9 =>") || contents.contains("0x69 =>")
+            || contents.contains("0x4C =>") || contents.contains("0x20 =>")
+        {
+            failures.push(format!("{}: contains 6502 opcode dispatch", name));
+        }
+
+        // No CPU register struct (a, x, y, sp, pc together)
+        if contents.contains("pc: u16")
+            && contents.contains("sp: u8")
+            && contents.contains("a: u8")
+        {
+            failures.push(format!("{}: contains 6502 CPU register struct", name));
+        }
+
+        // No NES memory map ranges
+        if contents.contains("0x2000..=0x3FFF") || contents.contains("0x8000..=0xFFFF") {
+            failures.push(format!("{}: contains NES memory map", name));
+        }
+
+        // No PPU shift registers
+        if contents.contains("bg_lo_shift") || contents.contains("bg_hi_shift") {
+            failures.push(format!("{}: contains PPU shift registers", name));
+        }
+
+        // No per-dot PPU tick
+        if contents.contains("fn tick(") {
+            failures.push(format!("{}: contains per-dot tick()", name));
+        }
+
+        // No OAM byte array (NES sprite hardware)
+        if contents.contains("oam: [u8; 256]") {
+            failures.push(format!("{}: contains raw OAM array", name));
+        }
+
+        // No nametable RAM (NES VRAM)
+        if contents.contains("nt_ram: [u8; 2048]") {
+            failures.push(format!("{}: contains nametable RAM array", name));
+        }
+
+        // No NES palette RAM
+        if contents.contains("palette: [u8; 32]") {
+            failures.push(format!("{}: contains NES palette RAM", name));
+        }
+
+        // Giant match blocks (>80 arms = likely opcode dispatch)
+        let match_arms = contents.matches("=> {").count()
+            + contents.matches("=> { let").count();
+        if match_arms > 80 {
+            failures.push(format!(
+                "{}: has {} match arms (likely opcode dispatch)", name, match_arms
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Level 5 violations found:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// Game logic must not be driven by a CPU interpreter.
+/// game.rs should use native Rust control flow, not instruction stepping.
+#[test]
+fn level5_game_uses_native_logic() {
+    let contents = read_src("game.rs").unwrap();
+    assert!(
+        !contents.contains("fn step("),
+        "game.rs still has CPU step() — game logic should be native Rust"
+    );
+    assert!(
+        !contents.contains("fn nes_step("),
+        "game.rs still has nes_step() — remove the NES emulation loop"
+    );
+    assert!(
+        !contents.contains("nmi_pending"),
+        "game.rs still uses NMI — native game doesn't need interrupts"
+    );
+}
+
+/// Renderer must do real work, not delegate to PPU emulation.
+#[test]
+fn level5_renderer_draws_tiles() {
+    let contents = read_src("renderer.rs").unwrap();
+    assert!(
+        contents.contains("fn draw_tile") || contents.contains("fn render_scanline")
+            || contents.contains("fn render_background"),
+        "renderer.rs must have tile drawing functions, not just delegate to PPU"
     );
 }

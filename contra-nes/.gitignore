@@ -3,4 +3,6 @@
 *.bmp
 *.ppm
 *.bin
+!src/contra_prg.bin
+!src/extracted/frame_trace.bin
 *.png

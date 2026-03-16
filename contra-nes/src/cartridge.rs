@@ -22,6 +22,18 @@ pub struct Cartridge {
 }
 
 impl Cartridge {
+    /// Create a cartridge from raw PRG data (no iNES header).
+    /// Used when PRG data is embedded directly in the binary.
+    pub fn from_prg(prg_data: &[u8], prg_banks: usize) -> Self {
+        Cartridge {
+            prg: prg_data.to_vec(),
+            chr_ram: [0; CHR_RAM_SIZE],
+            mirroring: Mirroring::Vertical, // Contra uses vertical mirroring
+            prg_banks,
+            bank_select: 0,
+        }
+    }
+
     pub fn from_ines(data: &[u8]) -> Self {
         assert!(data.len() >= 16, "ROM too small");
         assert!(data[0] == b'N' && data[1] == b'E' && data[2] == b'S' && data[3] == 0x1A,
