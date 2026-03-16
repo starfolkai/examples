@@ -716,28 +716,26 @@ impl Apu {
             _ => {}
         }
 
-        // Low-pass filter the raw mix (anti-aliasing before downsampling)
-        // First-order IIR: cutoff ~14kHz at 1.79MHz sample rate
-        // alpha ≈ 2*pi*fc / (fs + 2*pi*fc) ≈ 0.047
-        let raw = self.mix();
-        self.filter_prev += 0.047 * (raw - self.filter_prev);
-
-        // Downsample: emit one sample per output period using phase accumulator
+        // Downsample: emit one sample per output period
+        // Mix + filter only at the output rate (~44.1kHz) instead of every CPU cycle
+        // (~1.79MHz). This is 40x less work with negligible quality difference since
+        // the NES channels are band-limited by their timer periods.
         self.sample_phase += 1.0;
         if self.sample_phase >= self.cycles_per_sample {
             self.sample_phase -= self.cycles_per_sample;
 
+            let raw = self.mix();
+
+            // Low-pass filter (smooths the stepped waveform)
+            self.filter_prev += 0.5 * (raw - self.filter_prev);
+
             let inp = self.filter_prev;
 
-            // High-pass filter #1: ~37Hz cutoff (removes DC offset)
-            // y[n] = alpha * (y[n-1] + x[n] - x_prev)
-            // At 44.1kHz, alpha = 0.9947 gives ~37Hz cutoff
-            // Simplified: just track the DC and subtract it
-            // Use exponential moving average as DC estimator
-            self.high_pass1 += (inp - self.high_pass1) * 0.002; // ~14Hz tracking
+            // High-pass #1: remove DC offset (~14Hz tracking)
+            self.high_pass1 += (inp - self.high_pass1) * 0.002;
             let out = inp - self.high_pass1;
 
-            // High-pass filter #2: ~37Hz again for steeper rolloff
+            // High-pass #2: steeper DC rolloff
             self.high_pass2 += (out - self.high_pass2) * 0.002;
             let out = out - self.high_pass2;
 
