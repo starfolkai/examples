@@ -22,66 +22,39 @@ static NES_PAL: [[u8; 3]; 64] = [
 ];
 
 pub struct Ppu {
-    // VRAM
-    pub nt_ram: [u8; 2048],     // 2KB nametable RAM
-    pub palette: [u8; 32],       // palette RAM
-    pub oam: [u8; 256],          // OAM (sprite data)
-
-    // Registers
-    pub ctrl: u8,    // $2000 PPUCTRL
-    pub mask: u8,    // $2001 PPUMASK
-    pub status: u8,  // $2002 PPUSTATUS
+    pub nt_ram: [u8; 2048],
+    pub palette: [u8; 32],
+    pub oam: [u8; 256],
+    pub ctrl: u8,
+    pub mask: u8,
+    pub status: u8,
     pub oam_addr: u8,
-
-    // Scrolling (loopy registers)
-    pub v: u16,      // current VRAM address (15 bits)
-    pub t: u16,      // temporary VRAM address
-    pub x: u8,       // fine X scroll (3 bits)
-    pub w: bool,     // write toggle (first/second write)
-
-    // Internal latches
+    pub v: u16,
+    pub t: u16,
+    pub x: u8,
+    pub w: bool,
     pub read_buf: u8,
     pub open_bus: u8,
-
-    // Rendering state
     pub scanline: i32,
     pub dot: u32,
     pub frame_count: u64,
     pub odd_frame: bool,
-
-    // Background shift registers
     bg_lo_shift: u16,
     bg_hi_shift: u16,
     at_lo_shift: u16,
     at_hi_shift: u16,
-
-    // Background tile fetch pipeline
     nt_byte: u8,
     at_byte: u8,
     bg_lo: u8,
     bg_hi: u8,
-
-    // Sprite evaluation
     sprite_count: usize,
-
-    // Packed sprite scanline buffer
-    // Bits 0-1: pixel value (0=transparent)
-    // Bits 2-4: palette index (4-7)
-    // Bit 5: priority (0=front, 1=behind bg)
-    // Bit 6: sprite zero flag
     sp_line: [u8; SCREEN_W],
     sp_line_has_sprites: bool,
-
-    // Output — u32 ARGB (0x00RRGGBB) matching minifb native format
     pub framebuffer: [u32; SCREEN_W * SCREEN_H],
-
-    // Pre-computed palette → ARGB32 lookup (rebuilt on palette writes)
     pal_cache: [u32; 32],
-
-    // NMI
-    pub nmi_output: bool,    // from PPUCTRL bit 7
-    pub nmi_occurred: bool,  // from PPUSTATUS bit 7
-    pub nmi_line: bool,      // actual NMI signal to CPU
+    pub nmi_output: bool,
+    pub nmi_occurred: bool,
+    pub nmi_line: bool,
     nmi_delay: u8,
 }
 
@@ -390,11 +363,19 @@ impl Ppu {
             let addr = base + tile as u16 * 16 + (row & 7);
             let mut lo = cart.read_chr(addr);
             let mut hi = cart.read_chr(addr + 8);
+
+            // Skip fully transparent sprite rows
+            if lo | hi == 0 {
+                self.sprite_count += 1;
+                continue;
+            }
+
             if flip_h { lo = lo.reverse_bits(); hi = hi.reverse_bits(); }
 
             let zero_flag: u8 = if i == 0 { 0x40 } else { 0 };
             let prio_bits: u8 = priority << 5;
             let pal_bits: u8 = palette << 2;
+            let combined = pal_bits | prio_bits | zero_flag;
 
             // Pre-render into scanline buffer (first sprite wins)
             for dx in 0..8u8 {
@@ -409,7 +390,7 @@ impl Ppu {
                 if pixel == 0 { continue; }
 
                 unsafe {
-                    *self.sp_line.get_unchecked_mut(px) = pixel | pal_bits | prio_bits | zero_flag;
+                    *self.sp_line.get_unchecked_mut(px) = pixel | combined;
                 }
             }
 
@@ -419,17 +400,19 @@ impl Ppu {
         self.sp_line_has_sprites = self.sprite_count > 0;
     }
 
-    // Prefetch 2 tiles (dots 321-336) — unrolled, no per-dot branch
+    // Prefetch 2 tiles (dots 321-336) — direct CHR reads
     #[inline(always)]
     fn prefetch_two_tiles(&mut self, cart: &Cartridge) {
+        let fine_y = (self.v >> 12) & 7;
+        let bg_base = if self.ctrl & 0x10 != 0 { 0x1000u16 } else { 0 };
         // Tile 1 (dots 321-328)
         self.fetch_nt_byte(cart);
         self.fetch_at_byte(cart);
-        self.fetch_tile_lo(cart);
-        self.fetch_tile_hi(cart);
+        let chr_addr = bg_base + (self.nt_byte as u16) * 16 + fine_y;
+        self.bg_lo = cart.read_chr(chr_addr);
+        self.bg_hi = cart.read_chr(chr_addr + 8);
         self.load_bg_shifters();
         self.increment_x();
-        // Shift 8 times for tile 1
         self.bg_lo_shift <<= 8;
         self.bg_hi_shift <<= 8;
         self.at_lo_shift <<= 8;
@@ -437,8 +420,9 @@ impl Ppu {
         // Tile 2 (dots 329-336)
         self.fetch_nt_byte(cart);
         self.fetch_at_byte(cart);
-        self.fetch_tile_lo(cart);
-        self.fetch_tile_hi(cart);
+        let chr_addr = bg_base + (self.nt_byte as u16) * 16 + fine_y;
+        self.bg_lo = cart.read_chr(chr_addr);
+        self.bg_hi = cart.read_chr(chr_addr + 8);
         self.load_bg_shifters();
         self.increment_x();
         self.bg_lo_shift <<= 8;
@@ -513,8 +497,7 @@ impl Ppu {
         nmi
     }
 
-    // Render all 256 pixels of a visible scanline in a tight loop.
-    // This replaces 256 individual tick()+render_pixel() calls.
+    // Render all 256 pixels of a visible scanline.
     #[inline(always)]
     fn render_scanline_pixels(&mut self, cart: &Cartridge) {
         let py = self.scanline as usize;
@@ -526,7 +509,6 @@ impl Ppu {
         let fine_x = self.x;
         let fb_row = py * SCREEN_W;
 
-        // Fast path: no sprites on this scanline (common — many scanlines are BG-only)
         if !has_sprites || !show_sp {
             self.render_scanline_bg_only(cart, show_bg, show_bg_left, fine_x, fb_row);
         } else {
@@ -622,17 +604,48 @@ impl Ppu {
                 };
 
                 unsafe {
-                    let color = *self.pal_cache.get_unchecked(pal_addr);
-                    *self.framebuffer.get_unchecked_mut(fb_row + px) = color;
+                    *self.framebuffer.get_unchecked_mut(fb_row + px) = *self.pal_cache.get_unchecked(pal_addr);
                 }
-                self.bg_lo_shift <<= 1;
-                self.bg_hi_shift <<= 1;
-                self.at_lo_shift <<= 1;
-                self.at_hi_shift <<= 1;
+                self.bg_lo_shift <<= 1; self.bg_hi_shift <<= 1;
+                self.at_lo_shift <<= 1; self.at_hi_shift <<= 1;
             }
             self.load_bg_shifters();
             self.increment_x();
         }
+    }
+
+
+    /// Minimal scanline — no pixel rendering, only timing/NMI/flags
+    pub fn finish_scanline_minimal(&mut self, cart: &Cartridge) -> bool {
+        let mut nmi = false;
+        let sl = self.scanline;
+
+        if self.nmi_delay > 0 {
+            self.nmi_delay = 0;
+            if self.nmi_output && self.nmi_occurred {
+                nmi = true;
+            }
+        }
+
+        if sl == 241 {
+            self.status |= 0x80;
+            self.nmi_occurred = true;
+            self.nmi_change();
+        } else if sl == 261 {
+            self.status &= !0xE0;
+            self.nmi_occurred = false;
+            self.nmi_change();
+        }
+
+        self.dot = 0;
+        self.scanline = sl + 1;
+        if self.scanline > 261 {
+            self.scanline = 0;
+            self.odd_frame = !self.odd_frame;
+            self.frame_count += 1;
+        }
+
+        nmi
     }
 
     // ── Per-dot tick (used by tests that include PPU source directly) ──

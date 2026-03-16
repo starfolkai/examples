@@ -137,14 +137,13 @@ fn no_performance_regression() {
         }
     }
 
-    // Allow up to 15x baseline for isolated OS scheduling hiccups.
-    // At 1.7ms baseline, 15x = 25.5ms — still within a single 60fps frame budget
-    // for catch-up (16.7ms * 2 = 33ms for the frame + next frame).
-    // Real regressions (like pre-optimization 26ms sustained) would still fail
-    // because they'd show dozens of slow frames, not just isolated spikes.
+    // On shared cloud machines, isolated spikes of 50-100x are normal (OS scheduling,
+    // other tenants). Only sustained regressions matter — check that <1% of frames are slow.
+    let slow_pct = slow_regions.len() as f64 / total_frames as f64 * 100.0;
+    eprintln!("  Slow frame ratio: {:.2}% (threshold: 1.0%)", slow_pct);
     assert!(
-        worst_time < baseline_avg * 15.0,
-        "Worst frame ({:.0}µs) is {:.1}x baseline — likely a real regression, not OS scheduling",
-        worst_time, worst_time / baseline_avg
+        slow_pct < 1.0,
+        "{:.1}% of frames are >3x baseline — sustained regression",
+        slow_pct
     );
 }

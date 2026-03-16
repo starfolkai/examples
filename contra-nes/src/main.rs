@@ -150,7 +150,7 @@ fn build_autoplay_sequence() -> Vec<InputEvent> {
 
 // ── Terminal renderer ──
 
-fn render_to_terminal(fb: &[u8], scale: usize) {
+fn render_to_terminal(fb: &[u32], scale: usize) {
     let mut out = String::with_capacity(SCREEN_W / scale * SCREEN_H / scale * 20);
 
     // Move cursor to top-left
@@ -166,19 +166,15 @@ fn render_to_terminal(fb: &[u8], scale: usize) {
             let py_top = row * scale;
             let py_bot = (row + 1) * scale;
 
-            let top_off = (py_top * SCREEN_W + px) * 3;
-            let (tr, tg, tb) = if top_off + 2 < fb.len() {
-                (fb[top_off], fb[top_off + 1], fb[top_off + 2])
-            } else {
-                (0, 0, 0)
-            };
+            let top_pixel = if py_top < SCREEN_H && px < SCREEN_W {
+                fb[py_top * SCREEN_W + px]
+            } else { 0 };
+            let (tr, tg, tb) = ((top_pixel >> 16) & 0xFF, (top_pixel >> 8) & 0xFF, top_pixel & 0xFF);
 
-            let bot_off = (py_bot * SCREEN_W + px) * 3;
-            let (br, bg_, bb) = if bot_off + 2 < fb.len() {
-                (fb[bot_off], fb[bot_off + 1], fb[bot_off + 2])
-            } else {
-                (0, 0, 0)
-            };
+            let bot_pixel = if py_bot < SCREEN_H && px < SCREEN_W {
+                fb[py_bot * SCREEN_W + px]
+            } else { 0 };
+            let (br, bg_, bb) = ((bot_pixel >> 16) & 0xFF, (bot_pixel >> 8) & 0xFF, bot_pixel & 0xFF);
 
             // ▀ = upper half block: fg = top pixel, bg = bottom pixel
             out.push_str(&format!(
@@ -197,7 +193,7 @@ fn render_to_terminal(fb: &[u8], scale: usize) {
 
 // ── BMP writer ──
 
-fn write_bmp(path: &str, px: &[u8], w: u32, h: u32) {
+fn write_bmp(path: &str, px: &[u32], w: u32, h: u32) {
     let stride = ((w * 3 + 3) / 4 * 4) as usize;
     let data_sz = stride * h as usize;
     let mut f = fs::File::create(path).unwrap();
@@ -216,8 +212,11 @@ fn write_bmp(path: &str, px: &[u8], w: u32, h: u32) {
     let mut row = vec![0u8; stride];
     for y in (0..h as usize).rev() {
         for x in 0..w as usize {
-            let s = (y * w as usize + x) * 3;
-            row[x*3] = px[s+2]; row[x*3+1] = px[s+1]; row[x*3+2] = px[s];
+            let argb = px[y * w as usize + x];
+            let r = (argb >> 16) as u8;
+            let g = (argb >> 8) as u8;
+            let b = argb as u8;
+            row[x*3] = b; row[x*3+1] = g; row[x*3+2] = r; // BMP = BGR
         }
         f.write_all(&row).unwrap();
     }
@@ -225,10 +224,16 @@ fn write_bmp(path: &str, px: &[u8], w: u32, h: u32) {
 
 // ── PPM writer (for quick terminal viewing) ──
 
-fn write_ppm(path: &str, px: &[u8], w: u32, h: u32) {
+fn write_ppm(path: &str, px: &[u32], w: u32, h: u32) {
     let mut f = fs::File::create(path).unwrap();
     write!(f, "P6\n{} {}\n255\n", w, h).unwrap();
-    f.write_all(&px[..w as usize * h as usize * 3]).unwrap();
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let argb = px[y * w as usize + x];
+            let rgb = [(argb >> 16) as u8, (argb >> 8) as u8, argb as u8];
+            f.write_all(&rgb).unwrap();
+        }
+    }
 }
 
 fn main() {
@@ -303,6 +308,13 @@ fn main() {
             // Let minifb handle frame pacing (uses platform-native vsync/timing)
             window.set_target_fps(60);
 
+            // Pre-run a few frames to fill the audio buffer before starting playback.
+            // This prevents underruns at startup.
+            for _ in 0..4 {
+                nes.run_frame();
+                frame_num += 1;
+            }
+
             // Start audio output stream
             let audio_buf = nes.bus.apu.audio_buffer();
             let _audio_stream = {
@@ -313,30 +325,36 @@ fn main() {
                     let config = cpal::StreamConfig {
                         channels: 1,
                         sample_rate: cpal::SampleRate(apu::SAMPLE_RATE),
-                        buffer_size: cpal::BufferSize::Default,
+                        buffer_size: cpal::BufferSize::Fixed(512),
                     };
                     let buf = audio_buf.clone();
                     let stream = dev.build_output_stream(
                         &config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                            // Hold last sample on underrun instead of outputting silence
+                            // (silence = clicks/pops, holding = smooth decay)
+                            let mut last = 0.0f32;
                             for sample in data.iter_mut() {
-                                *sample = buf.read();
+                                if let Some(s) = buf.read() {
+                                    last = s;
+                                }
+                                *sample = last;
                             }
                         },
                         |err| eprintln!("Audio error: {}", err),
                         None,
                     ).ok()?;
                     stream.play().ok()?;
-                    eprintln!("  Audio: enabled (44.1kHz mono)");
+                    eprintln!("  Audio: enabled (44.1kHz mono, buffer=8192)");
                     Some(stream)
                 })
             };
 
-            let mut fb32 = vec![0u32; SCREEN_W * SCREEN_H];
             let mut autoplay_done = false;
 
             // Render initial black frame so update_with_buffer refreshes key state
-            window.update_with_buffer(&fb32, SCREEN_W, SCREEN_H).unwrap();
+            let black = vec![0u32; SCREEN_W * SCREEN_H];
+            window.update_with_buffer(&black, SCREEN_W, SCREEN_H).unwrap();
 
             while window.is_open() && !window.is_key_down(Key::Escape) && frame_num < max_frames {
                 // 1. Read input (key state was refreshed by update_with_buffer at end of prev iteration)
@@ -366,16 +384,9 @@ fn main() {
                 nes.run_frame();
                 frame_num += 1;
 
-                // 3. Convert RGB24 → ARGB32 for minifb
-                let fb = nes.framebuffer();
-                for i in 0..SCREEN_W * SCREEN_H {
-                    let o = i * 3;
-                    fb32[i] = (fb[o] as u32) << 16 | (fb[o + 1] as u32) << 8 | fb[o + 2] as u32;
-                }
-
-                // 4. Present frame — minifb handles timing internally (set_target_fps(60))
+                // 3. Present frame — framebuffer is already ARGB32, pass directly to minifb
                 //    This also refreshes key state for the next iteration
-                window.update_with_buffer(&fb32, SCREEN_W, SCREEN_H).unwrap();
+                window.update_with_buffer(nes.framebuffer(), SCREEN_W, SCREEN_H).unwrap();
             }
             eprintln!("  Played {} frames", frame_num);
         }
@@ -593,7 +604,12 @@ fn main() {
                     seq_idx += 1;
                 }
                 nes.run_frame();
-                out.write_all(&nes.framebuffer()[..SCREEN_W * SCREEN_H * 3]).unwrap();
+                // Convert ARGB32 to RGB24 for pipe
+                let fb = nes.framebuffer();
+                for &pixel in &fb[..SCREEN_W * SCREEN_H] {
+                    let rgb = [(pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8];
+                    out.write_all(&rgb).unwrap();
+                }
                 frame_num += 1;
             }
             out.flush().unwrap();

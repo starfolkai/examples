@@ -24,6 +24,21 @@ pub struct Cartridge {
 }
 
 impl Cartridge {
+    /// Create cartridge from embedded PRG data (compiled into binary by build.rs).
+    /// Contra: Mapper 2, 8×16KB PRG, CHR RAM, vertical mirroring.
+    pub fn from_embedded(prg_data: &[u8], prg_banks: usize) -> Self {
+        eprintln!("  ROM: embedded, PRG={}x16KB, CHR=RAM, mirror=V", prg_banks);
+        Cartridge {
+            prg: prg_data.to_vec(),
+            chr_ram: [0u8; CHR_RAM_SIZE],
+            mirroring: Mirroring::Vertical,
+            prg_banks,
+            bank_select: 0,
+            prg_switch_offset: 0,
+            prg_fixed_offset: (prg_banks - 1) * PRG_BANK_SIZE,
+        }
+    }
+
     pub fn from_ines(data: &[u8]) -> Self {
         assert!(data.len() >= 16, "ROM too small");
         assert!(data[0] == b'N' && data[1] == b'E' && data[2] == b'S' && data[3] == 0x1A,

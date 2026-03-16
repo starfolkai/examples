@@ -1,6 +1,7 @@
 // NES system — ties CPU, PPU, bus together
 //
-// PPU runs at 3x CPU clock. Each CPU step, advance PPU by 3× the cycles consumed.
+// PPU runs at 3x CPU clock. PPU ticks accumulate as debt and are
+// processed in scanline-sized batches for maximum throughput.
 
 use crate::bus::Bus;
 use crate::cartridge::Cartridge;
@@ -9,6 +10,7 @@ use crate::cpu::Cpu;
 pub struct Nes {
     pub cpu: Cpu,
     pub bus: Bus,
+    ppu_debt: u32, // accumulated PPU dots not yet processed
 }
 
 impl Nes {
@@ -16,6 +18,7 @@ impl Nes {
         let mut nes = Nes {
             cpu: Cpu::new(),
             bus: Bus::new(cart),
+            ppu_debt: 0,
         };
         nes.cpu.reset(&mut nes.bus);
         nes
@@ -31,10 +34,10 @@ impl Nes {
         self.bus.ppu.frame_count
     }
 
-    /// Single CPU step + PPU ticks + APU clock
+    /// Single CPU step + batched PPU scanlines + APU clock
     #[inline(always)]
     fn step(&mut self) {
-        // Handle DMA
+        // Handle DMA (rare — only after $4014 write)
         if self.bus.dma_pending {
             let cycles = self.bus.do_dma();
             self.cpu.stall += cycles;
@@ -42,29 +45,31 @@ impl Nes {
 
         let cpu_cycles = self.cpu.step(&mut self.bus);
 
-        // PPU: 3 ticks per CPU cycle
-        // Unroll the common case (most instructions are 2-4 cycles = 6-12 PPU ticks)
-        let ppu_ticks = cpu_cycles * 3;
-        let cart = &self.bus.cart;
-        for _ in 0..ppu_ticks {
-            if self.bus.ppu.tick(cart) {
-                self.cpu.nmi_pending = true;
+        // PPU: accumulate dots and process complete scanlines in batch
+        self.ppu_debt += cpu_cycles * 3;
+        if self.ppu_debt >= 341 {
+            loop {
+                self.ppu_debt -= 341;
+                let cart = &self.bus.cart;
+                if self.bus.ppu.finish_scanline(cart) {
+                    self.cpu.nmi_pending = true;
+                }
+                if self.ppu_debt < 341 { break; }
             }
         }
 
-        // APU: batch clock (most work is just counter decrements)
+        // APU: batch clock
         self.bus.apu.clock_batch(cpu_cycles);
 
-        // Handle DMC memory reads (rare — only when DMC channel is playing samples)
-        if self.bus.apu.dmc_read_pending.is_some() {
-            let addr = self.bus.apu.dmc_read_pending.take().unwrap();
-            let byte = self.bus.read(addr);
-            self.bus.apu.dmc_fill_buffer(byte);
-        }
-
-        // APU frame IRQ
-        if self.bus.apu.frame_irq {
-            self.cpu.irq_pending = true;
+        // DMC read + frame IRQ (both rare, combined into one branch)
+        if self.bus.apu.dmc_read_pending.is_some() | self.bus.apu.frame_irq {
+            if let Some(addr) = self.bus.apu.dmc_read_pending.take() {
+                let byte = self.bus.read(addr);
+                self.bus.apu.dmc_fill_buffer(byte);
+            }
+            if self.bus.apu.frame_irq {
+                self.cpu.irq_pending = true;
+            }
         }
     }
 
@@ -79,7 +84,7 @@ impl Nes {
         }
     }
 
-    pub fn framebuffer(&self) -> &[u8] {
+    pub fn framebuffer(&self) -> &[u32] {
         &self.bus.ppu.framebuffer
     }
 }

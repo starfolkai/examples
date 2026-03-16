@@ -63,14 +63,16 @@ impl Cpu {
 
     #[inline(always)]
     fn push(&mut self, bus: &mut Bus, val: u8) {
-        bus.write(0x100 + self.sp as u16, val);
+        // Stack is always at 0x100-0x1FF which is RAM — bypass bus dispatch
+        unsafe { *bus.ram.get_unchecked_mut(0x100 + self.sp as usize) = val; }
         self.sp = self.sp.wrapping_sub(1);
     }
 
     #[inline(always)]
     fn pull(&mut self, bus: &mut Bus) -> u8 {
         self.sp = self.sp.wrapping_add(1);
-        bus.read(0x100 + self.sp as u16)
+        // Stack is always at 0x100-0x1FF which is RAM — bypass bus dispatch
+        unsafe { *bus.ram.get_unchecked(0x100 + self.sp as usize) }
     }
 
     #[inline(always)]
@@ -94,6 +96,12 @@ impl Cpu {
 
     #[inline(always)]
     fn read16(&self, bus: &mut Bus, addr: u16) -> u16 {
+        // Fast path: both bytes in PRG ROM (most instruction fetches)
+        if addr >= 0x8000 && addr < 0xFFFF {
+            let lo = bus.cart.read_prg(addr) as u16;
+            let hi = bus.cart.read_prg(addr.wrapping_add(1)) as u16;
+            return lo | (hi << 8);
+        }
         let lo = bus.read(addr) as u16;
         let hi = bus.read(addr.wrapping_add(1)) as u16;
         lo | (hi << 8)
@@ -127,9 +135,11 @@ impl Cpu {
     // Returns cycles consumed by this step
     pub fn step(&mut self, bus: &mut Bus) -> u32 {
         if self.stall > 0 {
-            self.stall -= 1;
-            self.cycles += 1;
-            return 1;
+            // Consume all stall cycles at once instead of one-at-a-time
+            let s = self.stall;
+            self.stall = 0;
+            self.cycles += s as u64;
+            return s;
         }
 
         if self.nmi_pending {
@@ -140,29 +150,45 @@ impl Cpu {
         }
 
         let start = self.cycles;
-        let op = bus.read(self.pc);
+        // Fast opcode fetch — PC is always in PRG ROM
+        let op = if self.pc >= 0x8000 {
+            bus.cart.read_prg(self.pc)
+        } else {
+            bus.read(self.pc)
+        };
         self.pc = self.pc.wrapping_add(1);
 
-        // Addressing mode helpers (inline in each opcode for perf, but factor out common patterns)
+        // Fast operand read — PC is almost always in PRG ROM
+        macro_rules! read_pc {
+            () => {{
+                let v = if self.pc >= 0x8000 { bus.cart.read_prg(self.pc) } else { bus.read(self.pc) };
+                self.pc = self.pc.wrapping_add(1);
+                v
+            }}
+        }
+        // Addressing mode helpers
         macro_rules! imm {
             () => {{ let v = self.pc; self.pc = self.pc.wrapping_add(1); v }}
         }
         macro_rules! zp {
-            () => {{ let v = bus.read(self.pc) as u16; self.pc = self.pc.wrapping_add(1); v }}
+            () => {{ read_pc!() as u16 }}
         }
         macro_rules! zpx {
-            () => {{ let v = bus.read(self.pc).wrapping_add(self.x) as u16; self.pc = self.pc.wrapping_add(1); v }}
+            () => {{ read_pc!().wrapping_add(self.x) as u16 }}
         }
         macro_rules! zpy {
-            () => {{ let v = bus.read(self.pc).wrapping_add(self.y) as u16; self.pc = self.pc.wrapping_add(1); v }}
+            () => {{ read_pc!().wrapping_add(self.y) as u16 }}
         }
         macro_rules! abs {
-            () => {{ let v = self.read16(bus, self.pc); self.pc = self.pc.wrapping_add(2); v }}
+            () => {{
+                let lo = read_pc!() as u16;
+                let hi = read_pc!() as u16;
+                lo | (hi << 8)
+            }}
         }
         macro_rules! abx {
             () => {{
-                let base = self.read16(bus, self.pc);
-                self.pc = self.pc.wrapping_add(2);
+                let base = abs!();
                 let addr = base.wrapping_add(self.x as u16);
                 if base & 0xFF00 != addr & 0xFF00 { self.cycles += 1; }
                 addr
@@ -170,15 +196,13 @@ impl Cpu {
         }
         macro_rules! abx_nopage {
             () => {{
-                let base = self.read16(bus, self.pc);
-                self.pc = self.pc.wrapping_add(2);
+                let base = abs!();
                 base.wrapping_add(self.x as u16)
             }}
         }
         macro_rules! aby {
             () => {{
-                let base = self.read16(bus, self.pc);
-                self.pc = self.pc.wrapping_add(2);
+                let base = abs!();
                 let addr = base.wrapping_add(self.y as u16);
                 if base & 0xFF00 != addr & 0xFF00 { self.cycles += 1; }
                 addr
@@ -186,26 +210,25 @@ impl Cpu {
         }
         macro_rules! aby_nopage {
             () => {{
-                let base = self.read16(bus, self.pc);
-                self.pc = self.pc.wrapping_add(2);
+                let base = abs!();
                 base.wrapping_add(self.y as u16)
             }}
         }
         macro_rules! izx {
             () => {{
-                let ptr = bus.read(self.pc).wrapping_add(self.x);
-                self.pc = self.pc.wrapping_add(1);
-                let lo = bus.read(ptr as u16) as u16;
-                let hi = bus.read(ptr.wrapping_add(1) as u16) as u16;
+                let ptr = read_pc!().wrapping_add(self.x);
+                // ZP reads — always RAM
+                let lo = unsafe { *bus.ram.get_unchecked(ptr as usize) } as u16;
+                let hi = unsafe { *bus.ram.get_unchecked(ptr.wrapping_add(1) as usize) } as u16;
                 lo | (hi << 8)
             }}
         }
         macro_rules! izy {
             () => {{
-                let ptr = bus.read(self.pc);
-                self.pc = self.pc.wrapping_add(1);
-                let lo = bus.read(ptr as u16) as u16;
-                let hi = bus.read(ptr.wrapping_add(1) as u16) as u16;
+                let ptr = read_pc!();
+                // ZP reads — always RAM
+                let lo = unsafe { *bus.ram.get_unchecked(ptr as usize) } as u16;
+                let hi = unsafe { *bus.ram.get_unchecked(ptr.wrapping_add(1) as usize) } as u16;
                 let base = lo | (hi << 8);
                 let addr = base.wrapping_add(self.y as u16);
                 if base & 0xFF00 != addr & 0xFF00 { self.cycles += 1; }
@@ -214,18 +237,16 @@ impl Cpu {
         }
         macro_rules! izy_nopage {
             () => {{
-                let ptr = bus.read(self.pc);
-                self.pc = self.pc.wrapping_add(1);
-                let lo = bus.read(ptr as u16) as u16;
-                let hi = bus.read(ptr.wrapping_add(1) as u16) as u16;
+                let ptr = read_pc!();
+                let lo = unsafe { *bus.ram.get_unchecked(ptr as usize) } as u16;
+                let hi = unsafe { *bus.ram.get_unchecked(ptr.wrapping_add(1) as usize) } as u16;
                 let base = lo | (hi << 8);
                 base.wrapping_add(self.y as u16)
             }}
         }
         macro_rules! branch {
             ($cond:expr) => {{
-                let offset = bus.read(self.pc) as i8;
-                self.pc = self.pc.wrapping_add(1);
+                let offset = read_pc!() as i8;
                 if $cond {
                     let new_pc = self.pc.wrapping_add(offset as u16);
                     self.cycles += 1;

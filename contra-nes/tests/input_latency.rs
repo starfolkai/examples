@@ -35,10 +35,10 @@ fn load_rom() -> Option<Vec<u8>> {
     None
 }
 
-fn framebuffer_checksum(fb: &[u8]) -> u64 {
+fn framebuffer_checksum(fb: &[u32]) -> u64 {
     let mut hash = 0u64;
-    for (i, &b) in fb.iter().enumerate().step_by(7) {
-        hash = hash.wrapping_mul(31).wrapping_add(b as u64).wrapping_add(i as u64);
+    for (i, &pixel) in fb.iter().enumerate().step_by(7) {
+        hash = hash.wrapping_mul(31).wrapping_add(pixel as u64).wrapping_add(i as u64);
     }
     hash
 }

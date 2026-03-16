@@ -707,6 +707,18 @@ impl Apu {
         }
     }
 
+    /// Minimal APU clock — only frame counter for IRQ, no audio processing
+    #[inline(always)]
+    pub fn clock_batch_minimal(&mut self, cycles: u32) {
+        for _ in 0..cycles {
+            self.cycle_count += 1;
+            self.frame_counter += 1;
+            if self.frame_counter == self.frame_next {
+                self.dispatch_frame_event();
+            }
+        }
+    }
+
     /// Clock the APU once per CPU cycle
     #[inline(always)]
     fn clock(&mut self) {
