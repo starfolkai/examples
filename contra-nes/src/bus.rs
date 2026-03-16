@@ -44,12 +44,19 @@ impl Bus {
                 self.ppu.read_register(addr, cart)
             }
             0x4016 => {
+                if self.controller_strobe {
+                    // While strobe is high, continuously reload and return bit 0
+                    self.controller_shift[0] = self.controller[0];
+                }
                 let val = self.controller_shift[0] & 1;
                 self.controller_shift[0] >>= 1;
                 self.controller_shift[0] |= 0x80; // open bus pulls high
                 val
             }
             0x4017 => {
+                if self.controller_strobe {
+                    self.controller_shift[1] = self.controller[1];
+                }
                 let val = self.controller_shift[1] & 1;
                 self.controller_shift[1] >>= 1;
                 self.controller_shift[1] |= 0x80;
@@ -76,11 +83,13 @@ impl Bus {
                 self.dma_pending = true;
             }
             0x4016 => {
-                self.controller_strobe = val & 1 != 0;
-                if self.controller_strobe {
+                let new_strobe = val & 1 != 0;
+                // Latch shift registers on strobe 1→0 transition
+                if self.controller_strobe && !new_strobe {
                     self.controller_shift[0] = self.controller[0];
                     self.controller_shift[1] = self.controller[1];
                 }
+                self.controller_strobe = new_strobe;
             }
             0x4000..=0x4013 | 0x4015 | 0x4017 => {
                 self.apu.write_register(addr, val);

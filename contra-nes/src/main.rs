@@ -226,8 +226,8 @@ fn main() {
                 },
             ).expect("Failed to create window");
 
-            // Don't use minifb's fps limiter — we do our own timing
-            window.set_target_fps(0);
+            // Let minifb handle frame pacing (uses platform-native vsync/timing)
+            window.set_target_fps(60);
 
             // Start audio output stream
             let audio_buf = nes.bus.apu.audio_buffer();
@@ -260,11 +260,12 @@ fn main() {
 
             let mut fb32 = vec![0u32; SCREEN_W * SCREEN_H];
             let mut autoplay_done = false;
-            let frame_duration = std::time::Duration::from_nanos(16_666_667); // 60 Hz
-            let mut next_frame_time = Instant::now();
+
+            // Render initial black frame so update_with_buffer refreshes key state
+            window.update_with_buffer(&fb32, SCREEN_W, SCREEN_H).unwrap();
 
             while window.is_open() && !window.is_key_down(Key::Escape) && frame_num < max_frames {
-                // Autoplay Konami code + start
+                // 1. Read input (key state was refreshed by update_with_buffer at end of prev iteration)
                 if !autoplay_done {
                     while seq_idx < seq.len() && seq[seq_idx].frame <= frame_num {
                         nes.set_button(0, seq[seq_idx].button, seq[seq_idx].pressed);
@@ -287,26 +288,20 @@ fn main() {
                     nes.set_button(0, BTN_SELECT, window.is_key_down(Key::Space));
                 }
 
+                // 2. Run emulator frame
                 nes.run_frame();
                 frame_num += 1;
 
-                // Convert RGB24 → ARGB32 for minifb
+                // 3. Convert RGB24 → ARGB32 for minifb
                 let fb = nes.framebuffer();
                 for i in 0..SCREEN_W * SCREEN_H {
                     let o = i * 3;
                     fb32[i] = (fb[o] as u32) << 16 | (fb[o + 1] as u32) << 8 | fb[o + 2] as u32;
                 }
-                window.update_with_buffer(&fb32, SCREEN_W, SCREEN_H).unwrap();
 
-                // Smooth frame pacing — sleep until next frame, catch up if behind
-                next_frame_time += frame_duration;
-                let now = Instant::now();
-                if next_frame_time > now {
-                    std::thread::sleep(next_frame_time - now);
-                } else if now - next_frame_time > frame_duration * 3 {
-                    // Too far behind (>3 frames) — reset timing instead of rushing
-                    next_frame_time = now;
-                }
+                // 4. Present frame — minifb handles timing internally (set_target_fps(60))
+                //    This also refreshes key state for the next iteration
+                window.update_with_buffer(&fb32, SCREEN_W, SCREEN_H).unwrap();
             }
             eprintln!("  Played {} frames", frame_num);
         }
