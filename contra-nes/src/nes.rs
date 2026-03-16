@@ -41,25 +41,25 @@ impl Nes {
         }
 
         let cpu_cycles = self.cpu.step(&mut self.bus);
-        let ppu_cycles = cpu_cycles * 3;
 
-        for _ in 0..ppu_cycles {
-            let cart = &self.bus.cart;
-            let nmi = self.bus.ppu.tick(cart);
-            if nmi {
+        // PPU: 3 ticks per CPU cycle
+        // Unroll the common case (most instructions are 2-4 cycles = 6-12 PPU ticks)
+        let ppu_ticks = cpu_cycles * 3;
+        let cart = &self.bus.cart;
+        for _ in 0..ppu_ticks {
+            if self.bus.ppu.tick(cart) {
                 self.cpu.nmi_pending = true;
             }
         }
 
-        // Clock APU once per CPU cycle
-        for _ in 0..cpu_cycles {
-            self.bus.apu.clock();
+        // APU: batch clock (most work is just counter decrements)
+        self.bus.apu.clock_batch(cpu_cycles);
 
-            // Handle DMC memory reads
-            if let Some(addr) = self.bus.apu.dmc_read_pending.take() {
-                let byte = self.bus.read(addr);
-                self.bus.apu.dmc_fill_buffer(byte);
-            }
+        // Handle DMC memory reads (rare — only when DMC channel is playing samples)
+        if self.bus.apu.dmc_read_pending.is_some() {
+            let addr = self.bus.apu.dmc_read_pending.take().unwrap();
+            let byte = self.bus.read(addr);
+            self.bus.apu.dmc_fill_buffer(byte);
         }
 
         // APU frame IRQ

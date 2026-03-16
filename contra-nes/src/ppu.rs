@@ -246,16 +246,19 @@ impl Ppu {
     // ── Rendering helpers ──
 
     #[inline(always)]
+    #[allow(dead_code)]
     fn rendering_enabled(&self) -> bool {
         self.mask & 0x18 != 0
     }
 
+    #[inline(always)]
     fn fetch_nt_byte(&mut self, cart: &Cartridge) {
         let addr = 0x2000 | (self.v & 0x0FFF);
         let idx = cart.mirror_nt(addr);
         self.nt_byte = self.nt_ram[idx];
     }
 
+    #[inline(always)]
     fn fetch_at_byte(&mut self, cart: &Cartridge) {
         let v = self.v;
         let addr = 0x23C0 | (v & 0x0C00) | ((v >> 4) & 0x38) | ((v >> 2) & 7);
@@ -264,6 +267,7 @@ impl Ppu {
         self.at_byte = (self.nt_ram[idx] >> shift) & 3;
     }
 
+    #[inline(always)]
     fn fetch_tile_lo(&mut self, cart: &Cartridge) {
         let fine_y = (self.v >> 12) & 7;
         let base = if self.ctrl & 0x10 != 0 { 0x1000u16 } else { 0 };
@@ -271,6 +275,7 @@ impl Ppu {
         self.bg_lo = cart.read_chr(addr);
     }
 
+    #[inline(always)]
     fn fetch_tile_hi(&mut self, cart: &Cartridge) {
         let fine_y = (self.v >> 12) & 7;
         let base = if self.ctrl & 0x10 != 0 { 0x1000u16 } else { 0 };
@@ -278,6 +283,7 @@ impl Ppu {
         self.bg_hi = cart.read_chr(addr);
     }
 
+    #[inline(always)]
     fn load_bg_shifters(&mut self) {
         self.bg_lo_shift = (self.bg_lo_shift & 0xFF00) | self.bg_lo as u16;
         self.bg_hi_shift = (self.bg_hi_shift & 0xFF00) | self.bg_hi as u16;
@@ -295,6 +301,7 @@ impl Ppu {
         self.at_hi_shift <<= 1;
     }
 
+    #[inline(always)]
     fn increment_x(&mut self) {
         if self.v & 0x001F == 31 {
             self.v &= !0x001F;
@@ -304,6 +311,7 @@ impl Ppu {
         }
     }
 
+    #[inline(always)]
     fn increment_y(&mut self) {
         if (self.v & 0x7000) != 0x7000 {
             self.v += 0x1000;
@@ -322,11 +330,13 @@ impl Ppu {
         }
     }
 
+    #[inline(always)]
     fn copy_x(&mut self) {
         // v: ....A.. ...BCDEF <- t: ....A.. ...BCDEF
         self.v = (self.v & 0xFBE0) | (self.t & 0x041F);
     }
 
+    #[inline(always)]
     fn copy_y(&mut self) {
         // v: GHIA.BC DEF..... <- t: GHIA.BC DEF.....
         self.v = (self.v & 0x841F) | (self.t & 0x7BE0);
@@ -338,25 +348,32 @@ impl Ppu {
         let h: i32 = if tall { 16 } else { 8 };
         self.sprite_count = 0;
 
-        // Clear scanline buffer
-        self.sp_line_pixel = [0; SCREEN_W];
-        self.sp_line_palette = [0; SCREEN_W];
-        self.sp_line_priority = [0; SCREEN_W];
-        self.sp_line_zero = [false; SCREEN_W];
-        self.sp_line_valid = true;
+        // Clear only if previous scanline had sprites
+        if self.sp_line_valid {
+            // Fast: clear entire buffer (compiler will use memset)
+            // Only matters if sprites were present
+            self.sp_line_pixel = [0; SCREEN_W];
+            self.sp_line_palette = [0; SCREEN_W];
+            self.sp_line_priority = [0; SCREEN_W];
+            self.sp_line_zero = [false; SCREEN_W];
+        }
+        self.sp_line_valid = false;
+
+        let scanline = self.scanline;
 
         for i in 0..64 {
-            let y = self.oam[i * 4] as i32;
-            let row = self.scanline - y;
+            let base_idx = i * 4;
+            let y = self.oam[base_idx] as i32;
+            let row = scanline - y;
             if row < 0 || row >= h { continue; }
             if self.sprite_count >= 8 {
                 self.status |= 0x20;
                 break;
             }
 
-            let tile_idx = self.oam[i * 4 + 1];
-            let attr = self.oam[i * 4 + 2];
-            let sx = self.oam[i * 4 + 3] as usize;
+            let tile_idx = self.oam[base_idx + 1];
+            let attr = self.oam[base_idx + 2];
+            let sx = self.oam[base_idx + 3] as usize;
             let flip_h = attr & 0x40 != 0;
             let flip_v = attr & 0x80 != 0;
             let palette = (attr & 3) + 4;
@@ -379,7 +396,6 @@ impl Ppu {
             let mut hi = cart.read_chr(addr + 8);
             if flip_h { lo = lo.reverse_bits(); hi = hi.reverse_bits(); }
 
-            // Store raw patterns for compatibility
             let s = self.sprite_count;
             self.sprite_patterns_lo[s] = lo;
             self.sprite_patterns_hi[s] = hi;
@@ -387,11 +403,11 @@ impl Ppu {
             self.sprite_priorities[s] = priority;
             self.sprite_indices[s] = i as u8;
 
-            // Pre-render into scanline buffer (first sprite wins — don't overwrite)
+            // Pre-render into scanline buffer (first sprite wins)
             for dx in 0..8u8 {
                 let px = sx + dx as usize;
                 if px >= SCREEN_W { break; }
-                if self.sp_line_pixel[px] != 0 { continue; } // higher-priority sprite already here
+                if self.sp_line_pixel[px] != 0 { continue; }
 
                 let bit = 7 - dx;
                 let pixel = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
@@ -405,10 +421,13 @@ impl Ppu {
 
             self.sprite_count += 1;
         }
+
+        self.sp_line_valid = self.sprite_count > 0;
     }
 
     // ── Main tick — call 3x per CPU cycle ──
 
+    #[inline(always)]
     pub fn tick(&mut self, cart: &Cartridge) -> bool {
         let mut nmi_triggered = false;
 
@@ -419,91 +438,98 @@ impl Ppu {
             }
         }
 
-        let rendering = self.rendering_enabled();
-        let visible_line = self.scanline < 240;
-        let pre_line = self.scanline == 261;
-        let render_line = visible_line || pre_line;
-        let fetch_cycle = (1..=256).contains(&self.dot) || (321..=336).contains(&self.dot);
+        let dot = self.dot;
+        let scanline = self.scanline;
 
-        if rendering {
-            // ── Background rendering ──
-            if visible_line && (1..=256).contains(&self.dot) {
-                self.render_pixel(cart);
+        // Fast path: most dots on non-render scanlines (241-260) do nothing
+        if scanline >= 240 && scanline < 261 {
+            // VBlank region — only check NMI trigger
+            if scanline == 241 && dot == 1 {
+                self.status |= 0x80;
+                self.nmi_occurred = true;
+                self.nmi_change();
             }
+        } else {
+            let rendering = self.mask & 0x18 != 0;
+            let visible_line = scanline < 240;
+            let pre_line = scanline == 261;
 
-            if render_line && fetch_cycle {
-                self.shift_bg();
-                match self.dot & 7 {
-                    1 => self.fetch_nt_byte(cart),
-                    3 => self.fetch_at_byte(cart),
-                    5 => self.fetch_tile_lo(cart),
-                    7 => {
-                        self.fetch_tile_hi(cart);
-                        self.load_bg_shifters();
-                        self.increment_x();
+            if rendering {
+                // Visible pixel output (dots 1-256 on scanlines 0-239)
+                if visible_line && dot >= 1 && dot <= 256 {
+                    self.render_pixel(cart);
+                }
+
+                // Background fetch (dots 1-256 and 321-336)
+                let is_fetch = (dot >= 1 && dot <= 256) || (dot >= 321 && dot <= 336);
+                if (visible_line || pre_line) && is_fetch {
+                    self.shift_bg();
+                    match dot & 7 {
+                        1 => self.fetch_nt_byte(cart),
+                        3 => self.fetch_at_byte(cart),
+                        5 => self.fetch_tile_lo(cart),
+                        7 => {
+                            self.fetch_tile_hi(cart);
+                            self.load_bg_shifters();
+                            self.increment_x();
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                }
+
+                if visible_line || pre_line {
+                    if dot == 256 {
+                        self.increment_y();
+                    } else if dot == 257 {
+                        self.copy_x();
+                        if visible_line {
+                            self.evaluate_sprites(cart);
+                        }
+                    }
+                }
+
+                // Pre-render: copy Y at dots 280-304
+                if pre_line && dot >= 280 && dot <= 304 {
+                    self.copy_y();
                 }
             }
 
-            if render_line {
-                if self.dot == 256 {
-                    self.increment_y();
-                }
-                if self.dot == 257 {
-                    self.copy_x();
-                }
+            if pre_line && dot == 1 {
+                self.status &= !0xE0;
+                self.nmi_occurred = false;
+                self.nmi_change();
             }
-
-            // Sprite evaluation at dot 257
-            if visible_line && self.dot == 257 {
-                self.evaluate_sprites(cart);
-            }
-
-            // Pre-render: copy Y at dots 280-304
-            if pre_line && (280..=304).contains(&self.dot) {
-                self.copy_y();
-            }
-        }
-
-        // ── VBlank flag ──
-        if self.scanline == 241 && self.dot == 1 {
-            self.status |= 0x80;
-            self.nmi_occurred = true;
-            self.nmi_change();
-        }
-
-        if pre_line && self.dot == 1 {
-            self.status &= !0xE0; // clear VBlank, sprite 0, overflow
-            self.nmi_occurred = false;
-            self.nmi_change();
         }
 
         // ── Advance dot/scanline ──
-        self.dot += 1;
+        self.dot = dot + 1;
 
-        // Odd frame skip
-        if rendering && self.odd_frame && self.scanline == 261 && self.dot == 340 {
-            self.dot = 0;
-            self.scanline = 0;
-            self.odd_frame = !self.odd_frame;
-            self.frame_count += 1;
-            return nmi_triggered;
-        }
-
-        if self.dot > 340 {
-            self.dot = 0;
-            self.scanline += 1;
-            if self.scanline > 261 {
+        if dot >= 340 {
+            // Odd frame skip
+            let rendering = self.mask & 0x18 != 0;
+            if rendering && self.odd_frame && scanline == 261 && dot == 340 {
+                self.dot = 0;
                 self.scanline = 0;
                 self.odd_frame = !self.odd_frame;
                 self.frame_count += 1;
+                return nmi_triggered;
+            }
+
+            if dot > 340 {
+                self.dot = 0;
+                self.scanline = scanline + 1;
+                if self.scanline > 261 {
+                    self.scanline = 0;
+                    self.odd_frame = !self.odd_frame;
+                    self.frame_count += 1;
+                }
             }
         }
 
         nmi_triggered
     }
 
+    #[inline(always)]
     fn render_pixel(&mut self, _cart: &Cartridge) {
         let px = self.dot as usize - 1;
         let py = self.scanline as usize;
@@ -556,10 +582,11 @@ impl Ppu {
         let rgb = NES_PAL[nes_color as usize];
 
         let offset = (py * SCREEN_W + px) * 3;
-        if offset + 2 < self.framebuffer.len() {
-            self.framebuffer[offset] = rgb[0];
-            self.framebuffer[offset + 1] = rgb[1];
-            self.framebuffer[offset + 2] = rgb[2];
+        // Safety: px < 256, py < 240, offset < 256*240*3 = framebuffer.len()
+        unsafe {
+            *self.framebuffer.get_unchecked_mut(offset) = rgb[0];
+            *self.framebuffer.get_unchecked_mut(offset + 1) = rgb[1];
+            *self.framebuffer.get_unchecked_mut(offset + 2) = rgb[2];
         }
     }
 

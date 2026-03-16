@@ -659,8 +659,17 @@ impl Apu {
         self.pulse2.sweep.clock(&mut self.pulse2.timer);
     }
 
+    /// Clock the APU for multiple CPU cycles at once (batched from nes.rs step)
+    #[inline(always)]
+    pub fn clock_batch(&mut self, cycles: u32) {
+        for _ in 0..cycles {
+            self.clock();
+        }
+    }
+
     /// Clock the APU once per CPU cycle
-    pub fn clock(&mut self) {
+    #[inline(always)]
+    fn clock(&mut self) {
         self.cycle_count += 1;
 
         // Triangle clocks every CPU cycle
