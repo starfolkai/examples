@@ -61,13 +61,20 @@ pub struct Ppu {
     bg_lo: u8,
     bg_hi: u8,
 
-    // Sprite evaluation
+    // Sprite evaluation (raw OAM scan results)
     sprite_count: usize,
     sprite_patterns_lo: [u8; 8],
     sprite_patterns_hi: [u8; 8],
     sprite_positions: [u8; 8],
     sprite_priorities: [u8; 8],
     sprite_indices: [u8; 8],
+
+    // Pre-rendered sprite scanline buffer (avoids per-pixel sprite loop)
+    sp_line_pixel: [u8; SCREEN_W],
+    sp_line_palette: [u8; SCREEN_W],
+    sp_line_priority: [u8; SCREEN_W],
+    sp_line_zero: [bool; SCREEN_W],
+    sp_line_valid: bool,
 
     // Output
     pub framebuffer: [u8; SCREEN_W * SCREEN_H * 3],
@@ -98,6 +105,11 @@ impl Ppu {
             sprite_positions: [0; 8],
             sprite_priorities: [0; 8],
             sprite_indices: [0; 8],
+            sp_line_pixel: [0; SCREEN_W],
+            sp_line_palette: [0; SCREEN_W],
+            sp_line_priority: [0; SCREEN_W],
+            sp_line_zero: [false; SCREEN_W],
+            sp_line_valid: false,
             framebuffer: [0; SCREEN_W * SCREEN_H * 3],
             nmi_output: false, nmi_occurred: false, nmi_line: false,
             nmi_delay: 0,
@@ -320,27 +332,35 @@ impl Ppu {
         self.v = (self.v & 0x841F) | (self.t & 0x7BE0);
     }
 
-    // Sprite evaluation for current scanline
+    // Sprite evaluation + pre-render scanline buffer
     fn evaluate_sprites(&mut self, cart: &Cartridge) {
-        let tall = self.ctrl & 0x20 != 0; // 8x16 sprites
+        let tall = self.ctrl & 0x20 != 0;
         let h: i32 = if tall { 16 } else { 8 };
         self.sprite_count = 0;
+
+        // Clear scanline buffer
+        self.sp_line_pixel = [0; SCREEN_W];
+        self.sp_line_palette = [0; SCREEN_W];
+        self.sp_line_priority = [0; SCREEN_W];
+        self.sp_line_zero = [false; SCREEN_W];
+        self.sp_line_valid = true;
 
         for i in 0..64 {
             let y = self.oam[i * 4] as i32;
             let row = self.scanline - y;
             if row < 0 || row >= h { continue; }
             if self.sprite_count >= 8 {
-                self.status |= 0x20; // sprite overflow
+                self.status |= 0x20;
                 break;
             }
 
             let tile_idx = self.oam[i * 4 + 1];
             let attr = self.oam[i * 4 + 2];
-            let x = self.oam[i * 4 + 3];
-
+            let sx = self.oam[i * 4 + 3] as usize;
             let flip_h = attr & 0x40 != 0;
             let flip_v = attr & 0x80 != 0;
+            let palette = (attr & 3) + 4;
+            let priority = (attr >> 5) & 1;
 
             let mut row = row as u16;
             if flip_v { row = h as u16 - 1 - row; }
@@ -348,11 +368,7 @@ impl Ppu {
             let (base, tile) = if tall {
                 let base = if tile_idx & 1 != 0 { 0x1000u16 } else { 0u16 };
                 let tile = tile_idx & 0xFE;
-                if row >= 8 {
-                    (base, tile + 1)
-                } else {
-                    (base, tile)
-                }
+                if row >= 8 { (base, tile + 1) } else { (base, tile) }
             } else {
                 let base = if self.ctrl & 0x08 != 0 { 0x1000u16 } else { 0u16 };
                 (base, tile_idx)
@@ -361,18 +377,32 @@ impl Ppu {
             let addr = base + tile as u16 * 16 + (row & 7);
             let mut lo = cart.read_chr(addr);
             let mut hi = cart.read_chr(addr + 8);
+            if flip_h { lo = lo.reverse_bits(); hi = hi.reverse_bits(); }
 
-            if flip_h {
-                lo = lo.reverse_bits();
-                hi = hi.reverse_bits();
-            }
-
+            // Store raw patterns for compatibility
             let s = self.sprite_count;
             self.sprite_patterns_lo[s] = lo;
             self.sprite_patterns_hi[s] = hi;
-            self.sprite_positions[s] = x;
-            self.sprite_priorities[s] = (attr >> 5) & 1;
+            self.sprite_positions[s] = sx as u8;
+            self.sprite_priorities[s] = priority;
             self.sprite_indices[s] = i as u8;
+
+            // Pre-render into scanline buffer (first sprite wins — don't overwrite)
+            for dx in 0..8u8 {
+                let px = sx + dx as usize;
+                if px >= SCREEN_W { break; }
+                if self.sp_line_pixel[px] != 0 { continue; } // higher-priority sprite already here
+
+                let bit = 7 - dx;
+                let pixel = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+                if pixel == 0 { continue; }
+
+                self.sp_line_pixel[px] = pixel;
+                self.sp_line_palette[px] = palette;
+                self.sp_line_priority[px] = priority;
+                self.sp_line_zero[px] = i == 0;
+            }
+
             self.sprite_count += 1;
         }
     }
@@ -492,26 +522,16 @@ impl Ppu {
             (0, 0)
         };
 
-        // Sprite pixel
-        let (mut sp_pixel, mut sp_palette, mut sp_priority, mut sp_zero) = (0u8, 0u8, 0u8, false);
-        if self.mask & 0x10 != 0 && (px >= 8 || self.mask & 0x04 != 0) {
-            for s in 0..self.sprite_count {
-                let offset = px as i32 - self.sprite_positions[s] as i32;
-                if offset < 0 || offset >= 8 { continue; }
-
-                let bit = 7 - offset as u8;
-                let p0 = (self.sprite_patterns_lo[s] >> bit) & 1;
-                let p1 = (self.sprite_patterns_hi[s] >> bit) & 1;
-                let pixel = p0 | (p1 << 1);
-                if pixel == 0 { continue; }
-
-                sp_pixel = pixel;
-                sp_palette = (self.oam[self.sprite_indices[s] as usize * 4 + 2] & 3) + 4;
-                sp_priority = self.sprite_priorities[s];
-                sp_zero = self.sprite_indices[s] == 0;
-                break;
-            }
-        }
+        // Sprite pixel (pre-rendered scanline buffer lookup — O(1))
+        let (sp_pixel, sp_palette, sp_priority, sp_zero) = if self.mask & 0x10 != 0
+            && (px >= 8 || self.mask & 0x04 != 0)
+            && self.sp_line_valid
+        {
+            (self.sp_line_pixel[px], self.sp_line_palette[px],
+             self.sp_line_priority[px], self.sp_line_zero[px])
+        } else {
+            (0, 0, 0, false)
+        };
 
         // Priority mux
         let (color_idx, palette_idx) = match (bg_pixel != 0, sp_pixel != 0) {

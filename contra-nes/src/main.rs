@@ -163,7 +163,7 @@ fn main() {
 
     let mut rom_path = String::from("contra.nes");
     let mut mode = "window"; // window, benchmark, headless, terminal, export
-    let mut max_frames = 6000u32;
+    let mut max_frames = u32::MAX; // unlimited for window/play modes
     let mut scale = 4usize;
     let mut export_dir = String::from(".");
     let mut export_interval = 500u32;
@@ -225,10 +225,13 @@ fn main() {
                 },
             ).expect("Failed to create window");
 
-            window.set_target_fps(60);
+            // Don't use minifb's fps limiter — we do our own timing
+            window.set_target_fps(0);
 
             let mut fb32 = vec![0u32; SCREEN_W * SCREEN_H];
             let mut autoplay_done = false;
+            let frame_duration = std::time::Duration::from_nanos(16_666_667); // 60 Hz
+            let mut next_frame_time = Instant::now();
 
             while window.is_open() && !window.is_key_down(Key::Escape) && frame_num < max_frames {
                 // Autoplay Konami code + start
@@ -244,7 +247,6 @@ fn main() {
                 }
 
                 if autoplay_done {
-                    // Keyboard → NES buttons
                     nes.set_button(0, BTN_RIGHT, window.is_key_down(Key::Right) || window.is_key_down(Key::D));
                     nes.set_button(0, BTN_LEFT, window.is_key_down(Key::Left) || window.is_key_down(Key::A));
                     nes.set_button(0, BTN_UP, window.is_key_down(Key::Up) || window.is_key_down(Key::W));
@@ -258,13 +260,23 @@ fn main() {
                 nes.run_frame();
                 frame_num += 1;
 
-                // Convert RGB24 framebuffer → ARGB32 for minifb
+                // Convert RGB24 → ARGB32 for minifb
                 let fb = nes.framebuffer();
                 for i in 0..SCREEN_W * SCREEN_H {
                     let o = i * 3;
                     fb32[i] = (fb[o] as u32) << 16 | (fb[o + 1] as u32) << 8 | fb[o + 2] as u32;
                 }
                 window.update_with_buffer(&fb32, SCREEN_W, SCREEN_H).unwrap();
+
+                // Smooth frame pacing — sleep until next frame, catch up if behind
+                next_frame_time += frame_duration;
+                let now = Instant::now();
+                if next_frame_time > now {
+                    std::thread::sleep(next_frame_time - now);
+                } else if now - next_frame_time > frame_duration * 3 {
+                    // Too far behind (>3 frames) — reset timing instead of rushing
+                    next_frame_time = now;
+                }
             }
             eprintln!("  Played {} frames", frame_num);
         }
