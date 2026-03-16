@@ -245,10 +245,8 @@ fn main() {
                     let stream = dev.build_output_stream(
                         &config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            if let Ok(mut ab) = buf.lock() {
-                                for sample in data.iter_mut() {
-                                    *sample = ab.read();
-                                }
+                            for sample in data.iter_mut() {
+                                *sample = buf.read();
                             }
                         },
                         |err| eprintln!("Audio error: {}", err),

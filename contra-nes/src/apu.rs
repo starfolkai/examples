@@ -3,7 +3,8 @@
 // Frame counter drives envelope/length/sweep at 240Hz.
 // Audio output mixed to mono f32 samples at ~1.79MHz, downsampled to 44.1kHz.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 pub const SAMPLE_RATE: u32 = 44100;
 const CPU_FREQ: f64 = 1_789_773.0;
@@ -448,49 +449,62 @@ impl Dmc {
     }
 }
 
-// ── Audio ring buffer ──
+// ── Lock-free audio ring buffer ──
+// Single-producer (emulator thread), single-consumer (cpal audio callback).
+// Uses atomic indices so no mutex is needed.
 
 pub struct AudioBuffer {
     buf: Vec<f32>,
-    write_pos: usize,
-    read_pos: usize,
+    write_pos: AtomicUsize,
+    read_pos: AtomicUsize,
     capacity: usize,
 }
+
+// Safety: buf is only written by one thread (producer at write_pos)
+// and only read by one thread (consumer at read_pos). The atomics
+// ensure proper ordering.
+unsafe impl Send for AudioBuffer {}
+unsafe impl Sync for AudioBuffer {}
 
 impl AudioBuffer {
     pub fn new(capacity: usize) -> Self {
         AudioBuffer {
             buf: vec![0.0; capacity],
-            write_pos: 0,
-            read_pos: 0,
+            write_pos: AtomicUsize::new(0),
+            read_pos: AtomicUsize::new(0),
             capacity,
         }
     }
 
-    pub fn write(&mut self, sample: f32) {
-        let next = (self.write_pos + 1) % self.capacity;
-        if next != self.read_pos { // drop sample if full
-            self.buf[self.write_pos] = sample;
-            self.write_pos = next;
+    /// Producer: write a sample (drops if full)
+    pub fn write(&self, sample: f32) {
+        let wp = self.write_pos.load(Ordering::Relaxed);
+        let next = (wp + 1) % self.capacity;
+        if next != self.read_pos.load(Ordering::Acquire) {
+            // Safety: only the producer writes to buf[wp], and we checked it's not
+            // overlapping with the consumer's read position
+            let ptr = self.buf.as_ptr() as *mut f32;
+            unsafe { ptr.add(wp).write(sample); }
+            self.write_pos.store(next, Ordering::Release);
         }
     }
 
-    pub fn read(&mut self) -> f32 {
-        if self.read_pos == self.write_pos {
-            return 0.0; // underrun
+    /// Consumer: read a sample (returns 0 on underrun)
+    pub fn read(&self) -> f32 {
+        let rp = self.read_pos.load(Ordering::Relaxed);
+        if rp == self.write_pos.load(Ordering::Acquire) {
+            return 0.0;
         }
-        let val = self.buf[self.read_pos];
-        self.read_pos = (self.read_pos + 1) % self.capacity;
+        let val = self.buf[rp];
+        self.read_pos.store((rp + 1) % self.capacity, Ordering::Release);
         val
     }
 
     #[allow(dead_code)]
     pub fn available(&self) -> usize {
-        if self.write_pos >= self.read_pos {
-            self.write_pos - self.read_pos
-        } else {
-            self.capacity - self.read_pos + self.write_pos
-        }
+        let wp = self.write_pos.load(Ordering::Relaxed);
+        let rp = self.read_pos.load(Ordering::Relaxed);
+        if wp >= rp { wp - rp } else { self.capacity - rp + wp }
     }
 }
 
@@ -518,7 +532,7 @@ pub struct Apu {
     high_pass1: f32,          // first high-pass filter (removes DC offset ~90Hz)
     high_pass2: f32,          // second high-pass filter (~440Hz for crispness)
 
-    pub audio_buf: Arc<Mutex<AudioBuffer>>,
+    pub audio_buf: Arc<AudioBuffer>,
 
     // DMC memory read callback result
     pub dmc_read_pending: Option<u16>,
@@ -526,7 +540,9 @@ pub struct Apu {
 
 impl Apu {
     pub fn new() -> Self {
-        let buf = Arc::new(Mutex::new(AudioBuffer::new(16384)));
+        // ~3000 samples = ~68ms at 44.1kHz — enough for ~4 frames of audio,
+        // small enough to keep latency tight
+        let buf = Arc::new(AudioBuffer::new(4096));
         Apu {
             pulse1: Pulse::new(true),
             pulse2: Pulse::new(false),
@@ -549,7 +565,7 @@ impl Apu {
         }
     }
 
-    pub fn audio_buffer(&self) -> Arc<Mutex<AudioBuffer>> {
+    pub fn audio_buffer(&self) -> Arc<AudioBuffer> {
         Arc::clone(&self.audio_buf)
     }
 
@@ -727,10 +743,7 @@ impl Apu {
 
             // Scale and clamp
             let final_sample = (out * 1.2).clamp(-1.0, 1.0);
-
-            if let Ok(mut buf) = self.audio_buf.lock() {
-                buf.write(final_sample);
-            }
+            self.audio_buf.write(final_sample);
         }
     }
 
