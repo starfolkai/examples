@@ -54,8 +54,6 @@ pub struct Ppu {
     bg_hi_shift: u16,
     at_lo_shift: u16,
     at_hi_shift: u16,
-    at_latch_lo: bool,
-    at_latch_hi: bool,
 
     // Background tile fetch pipeline
     nt_byte: u8,
@@ -93,7 +91,6 @@ impl Ppu {
             scanline: 0, dot: 0, frame_count: 0, odd_frame: false,
             bg_lo_shift: 0, bg_hi_shift: 0,
             at_lo_shift: 0, at_hi_shift: 0,
-            at_latch_lo: false, at_latch_hi: false,
             nt_byte: 0, at_byte: 0, bg_lo: 0, bg_hi: 0,
             sprite_count: 0,
             sprite_patterns_lo: [0; 8],
@@ -272,15 +269,18 @@ impl Ppu {
     fn load_bg_shifters(&mut self) {
         self.bg_lo_shift = (self.bg_lo_shift & 0xFF00) | self.bg_lo as u16;
         self.bg_hi_shift = (self.bg_hi_shift & 0xFF00) | self.bg_hi as u16;
-        self.at_latch_lo = self.at_byte & 1 != 0;
-        self.at_latch_hi = self.at_byte & 2 != 0;
+        // Fill low 8 bits with attribute value (all 1s or all 0s).
+        // This ensures correct palette across tile boundaries with fine scroll.
+        self.at_lo_shift = (self.at_lo_shift & 0xFF00) | if self.at_byte & 1 != 0 { 0xFF } else { 0x00 };
+        self.at_hi_shift = (self.at_hi_shift & 0xFF00) | if self.at_byte & 2 != 0 { 0xFF } else { 0x00 };
     }
 
+    #[inline(always)]
     fn shift_bg(&mut self) {
         self.bg_lo_shift <<= 1;
         self.bg_hi_shift <<= 1;
-        self.at_lo_shift = (self.at_lo_shift << 1) | if self.at_latch_lo { 1 } else { 0 };
-        self.at_hi_shift = (self.at_hi_shift << 1) | if self.at_latch_hi { 1 } else { 0 };
+        self.at_lo_shift <<= 1;
+        self.at_hi_shift <<= 1;
     }
 
     fn increment_x(&mut self) {
