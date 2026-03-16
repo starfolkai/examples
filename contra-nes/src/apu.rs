@@ -510,22 +510,23 @@ pub struct Apu {
     frame_counter: u32,
     _frame_step: u8,
 
-    // Sample output
+    // Sample output with low-pass filtering
     cycle_count: u64,
-    sample_accum: f32,
-    sample_count: u32,
+    sample_phase: f64,        // fractional phase accumulator for resampling
     cycles_per_sample: f64,
+    filter_prev: f32,         // first-order low-pass state
+    high_pass1: f32,          // first high-pass filter (removes DC offset ~90Hz)
+    high_pass2: f32,          // second high-pass filter (~440Hz for crispness)
 
     pub audio_buf: Arc<Mutex<AudioBuffer>>,
 
     // DMC memory read callback result
-    _dmc_sample_byte: u8,
     pub dmc_read_pending: Option<u16>,
 }
 
 impl Apu {
     pub fn new() -> Self {
-        let buf = Arc::new(Mutex::new(AudioBuffer::new(8192)));
+        let buf = Arc::new(Mutex::new(AudioBuffer::new(16384)));
         Apu {
             pulse1: Pulse::new(true),
             pulse2: Pulse::new(false),
@@ -538,11 +539,12 @@ impl Apu {
             frame_counter: 0,
             _frame_step: 0,
             cycle_count: 0,
-            sample_accum: 0.0,
-            sample_count: 0,
+            sample_phase: 0.0,
             cycles_per_sample: CPU_FREQ / SAMPLE_RATE as f64,
+            filter_prev: 0.0,
+            high_pass1: 0.0,
+            high_pass2: 0.0,
             audio_buf: buf,
-            _dmc_sample_byte: 0,
             dmc_read_pending: None,
         }
     }
@@ -698,23 +700,41 @@ impl Apu {
             _ => {}
         }
 
-        // Downsample to output rate
-        let sample = self.mix();
-        self.sample_accum += sample;
-        self.sample_count += 1;
+        // Low-pass filter the raw mix (anti-aliasing before downsampling)
+        // First-order IIR: cutoff ~14kHz at 1.79MHz sample rate
+        // alpha ≈ 2*pi*fc / (fs + 2*pi*fc) ≈ 0.047
+        let raw = self.mix();
+        self.filter_prev += 0.047 * (raw - self.filter_prev);
 
-        let threshold = self.cycles_per_sample;
-        if self.sample_count as f64 >= threshold {
-            let avg = self.sample_accum / self.sample_count as f32;
+        // Downsample: emit one sample per output period using phase accumulator
+        self.sample_phase += 1.0;
+        if self.sample_phase >= self.cycles_per_sample {
+            self.sample_phase -= self.cycles_per_sample;
+
+            let inp = self.filter_prev;
+
+            // High-pass filter #1: ~37Hz cutoff (removes DC offset)
+            // y[n] = alpha * (y[n-1] + x[n] - x_prev)
+            // At 44.1kHz, alpha = 0.9947 gives ~37Hz cutoff
+            // Simplified: just track the DC and subtract it
+            // Use exponential moving average as DC estimator
+            self.high_pass1 += (inp - self.high_pass1) * 0.002; // ~14Hz tracking
+            let out = inp - self.high_pass1;
+
+            // High-pass filter #2: ~37Hz again for steeper rolloff
+            self.high_pass2 += (out - self.high_pass2) * 0.002;
+            let out = out - self.high_pass2;
+
+            // Scale and clamp
+            let final_sample = (out * 1.2).clamp(-1.0, 1.0);
+
             if let Ok(mut buf) = self.audio_buf.lock() {
-                buf.write(avg);
+                buf.write(final_sample);
             }
-            self.sample_accum = 0.0;
-            self.sample_count = 0;
         }
     }
 
-    /// NES mixer — nonlinear mixing via lookup approximation
+    /// NES mixer — nonlinear mixing (outputs 0.0 to ~1.0)
     fn mix(&self) -> f32 {
         let p1 = self.pulse1.output() as f32;
         let p2 = self.pulse2.output() as f32;
@@ -722,21 +742,21 @@ impl Apu {
         let n = self.noise.output() as f32;
         let d = self.dmc.output() as f32;
 
-        // Pulse output
+        // Pulse output (0.0 to ~0.256)
         let pulse_out = if p1 + p2 > 0.0 {
             95.88 / (8128.0 / (p1 + p2) + 100.0)
         } else {
             0.0
         };
 
-        // TND output
+        // TND output (0.0 to ~0.741)
         let tnd_out = if t + n + d > 0.0 {
             159.79 / (1.0 / (t / 8227.0 + n / 12241.0 + d / 22638.0) + 100.0)
         } else {
             0.0
         };
 
-        (pulse_out + tnd_out) * 2.0 - 0.5 // scale to roughly -0.5..0.5
+        pulse_out + tnd_out // 0.0 to ~1.0 (DC removed by high-pass filters)
     }
 
     /// Feed DMC a byte read from memory
